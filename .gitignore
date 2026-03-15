@@ -20,48 +20,34 @@ dist/
 build/
 *.egg-info/
 
-# ----------------------------
 # Python packaging artifacts
-# ----------------------------
 *.egg
 *.whl
 
-# ----------------------------
 # Logs
-# ----------------------------
 *.log
 
-# ----------------------------
 # OS files
-# ----------------------------
 .DS_Store
 Thumbs.db
 
-# ----------------------------
 # Editor / IDE
-# ----------------------------
 .vscode/
 .idea/
 *.swp
 *.swo
 
-# ----------------------------
 # Testing / coverage
-# ----------------------------
 .coverage
 .pytest_cache/
 htmlcov/
 
-# ----------------------------
 # Model caches (optional)
 # sentence-transformers downloads
-# ----------------------------
 .cache/
 models/
 
-# ----------------------------
 # Temporary audio files
-# ----------------------------
 *.wav
 *.mp3
 *.tmp

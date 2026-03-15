@@ -68,7 +68,7 @@ async def warmup():
     except Exception as e:
         logger.warning(f"STT warmup failed (non-critical): {e}")
 
-    # RAG warmup — loads sentence-transformers model + embeds knowledge base
+    # RAG warmup : loads sentence-transformers model + embeds knowledge base
     logger.info("Warming up RAG...")
     try:
         from rag import init_rag

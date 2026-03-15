@@ -21,7 +21,7 @@ import numpy as np
 
 from stt import transcribe_audio
 from llm import stream_llm_response
-from tts import stream_tts_audio
+from tts import stream_tts_audio, cancel_current_tts
 from vad import VAD
 
 logger = logging.getLogger("pipeline")
@@ -133,7 +133,7 @@ class VoicePipeline:
         logger.info(f"[{self.session_id}] ⚡ INTERRUPT CALLED")
         self._interrupt_event.set()
         logger.info(f"[{self.session_id}] ⚡ Calling cancel_current_tts()")
-        # cancel_current_tts()
+        cancel_current_tts()
         logger.info(f"[{self.session_id}] ⚡ cancel_current_tts() done")
         if self._current_tts_task and not self._current_tts_task.done():
             self._current_tts_task.cancel()
@@ -162,7 +162,7 @@ class VoicePipeline:
 
         self.conversation_history.append({"role": "user", "content": transcript})
 
-        # 2. RAG context retrieval — time it separately
+        # 2. RAG context retrieval , time it separately
         t_rag = time.perf_counter()
         self._interrupt_event.clear()
         self._ai_speaking = True
@@ -248,7 +248,7 @@ class VoicePipeline:
 
     async def _send_tts_for_sentence(self, sentence: str):
         """Stream TTS audio chunks for a single sentence."""
-        # Check interrupt BEFORE starting synthesis — skip sentence entirely
+        # Check interrupt BEFORE starting synthesis , skip sentence entirely
         if self._interrupt_event.is_set():
             return
         try:

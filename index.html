@@ -370,7 +370,7 @@
 const SAMPLE_RATE = 16000;
 const CHUNK_SIZE  = 4096;   // power of 2, ~256ms at 16kHz
 
-// ─── State ──────────────────────────────────────────────────
+// State 
 let ws             = null;
 let audioContext   = null;   // mic AudioContext (16kHz)
 let micStream      = null;
@@ -387,7 +387,7 @@ let currentAiText  = "";
 let turnStartTime  = null;
 let lastInterrupt = 0;
 
-// ─── Web Audio API playback ──────────────────────────────────
+// Web Audio API playback 
 // Using Web Audio API instead of <audio> element because
 // AudioBufferSourceNode.stop() is instant and reliable —
 // unlike <audio>.pause() which can leave buffered audio playing.
@@ -413,7 +413,7 @@ function stopAudioNow() {
   isPlaying    = false;
 
   // Stop the currently playing source node immediately
-  // AudioBufferSourceNode.stop() is a hardware-level stop —
+  // AudioBufferSourceNode.stop() is a hardware-level stop 
   // no buffered audio continues after this call
   if (currentSource) {
     try {
@@ -421,7 +421,7 @@ function stopAudioNow() {
       currentSource.stop();
       currentSource.disconnect();
     } catch(e) {
-      // already stopped — safe to ignore
+      // already stopped ,safe to ignore
     }
     currentSource = null;
   }
@@ -435,7 +435,7 @@ async function handleAudioChunk(bytes) {
 
   try {
     const ctx = getPlaybackContext();
-    // Copy the buffer — decodeAudioData detaches the original
+    // Copy the buffer , decodeAudioData detaches the original
     const arrayBuffer = bytes.buffer.slice(
       bytes.byteOffset,
       bytes.byteOffset + bytes.byteLength
@@ -477,7 +477,7 @@ function playNext() {
   source.start(0);
 }
 
-// ─── WebSocket ───────────────────────────────────────────────
+// WebSocket 
 function toggleConnection() {
   isConnected ? disconnect() : connect();
 }
@@ -529,7 +529,7 @@ function disconnect() {
   stopMic();
 }
 
-// ─── Control messages ────────────────────────────────────────
+// Control messages 
 function handleControlMessage(msg) {
   switch (msg.type) {
 
@@ -588,7 +588,7 @@ function handleControlMessage(msg) {
   }
 }
 
-// ─── Microphone ──────────────────────────────────────────────
+// Microphone 
 async function startMic() {
   try {
     micStream = await navigator.mediaDevices.getUserMedia({
@@ -617,7 +617,7 @@ async function startMic() {
 
       const float32 = event.inputBuffer.getChannelData(0);
 
-      // Interruption detection — runs every ~256ms
+      // Interruption detection , runs every ~256ms
       if (isAISpeaking || isPlaying) {
         const rms = Math.sqrt(
           float32.reduce((s, v) => s + v * v, 0) / float32.length
@@ -663,7 +663,7 @@ function stopMic() {
   isMicActive = false;
 }
 
-// ─── Waveform visualisation ───────────────────────────────────
+// Waveform visualisation 
 function drawWaveform() {
   if (!analyserNode) return;
   const canvas = document.getElementById("waveform");
@@ -696,7 +696,7 @@ function drawWaveform() {
   })();
 }
 
-// ─── UI helpers ───────────────────────────────────────────────
+// UI helpers 
 function setStatus(state, text) {
   document.getElementById("statusDot").className  = "status-dot " + state;
   document.getElementById("statusText").textContent = text;
