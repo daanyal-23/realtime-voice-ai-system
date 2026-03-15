@@ -1,0 +1,24 @@
+SniperThink Voice AI Assistant Knowledge Base
+
+SniperThink is an AI-first technology company building real-time voice intelligence systems.
+The company specializes in low-latency conversational AI, voice pipelines, and streaming audio infrastructure.
+
+Our core products include:
+- Real-time voice agents for customer support
+- Voice-enabled developer tools
+- Audio analytics and transcription pipelines
+
+Technical Philosophy:
+We believe in building from first principles. Rather than relying on abstracted voice platforms,
+we construct our pipelines at the infrastructure level — owning latency, quality, and control at each stage.
+
+Key latency targets:
+- Speech-to-text: under 400ms
+- LLM first token: under 600ms
+- First audio to user: under 1 second end-to-end
+
+Our stack uses WebSockets for transport, Whisper for speech recognition,
+Llama 3.3 70B via Groq for language understanding, and edge-tts for speech synthesis.
+
+The company is headquartered in India with remote-first engineering teams.
+We are hiring AI/ML engineers, DevOps engineers, and full-stack developers.

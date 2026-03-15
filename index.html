@@ -1,0 +1,776 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Voice AI — SniperThink</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:ital,wght@0,300;0,500;1,300&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #0a0a0f;
+      --surface: #12121a;
+      --border: #1e1e2e;
+      --accent: #7c6af7;
+      --accent-glow: rgba(124,106,247,0.25);
+      --green: #3dffa0;
+      --red: #ff5f5f;
+      --text: #e8e8f0;
+      --muted: #6b6b80;
+      --mono: 'Space Mono', monospace;
+      --body: 'DM Sans', sans-serif;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--body);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 16px 28px;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    .logo {
+      font-family: var(--mono);
+      font-size: 13px;
+      letter-spacing: 3px;
+      text-transform: uppercase;
+      color: var(--accent);
+    }
+    .status-pill {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--muted);
+      letter-spacing: 1px;
+    }
+    .status-dot {
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      background: var(--muted);
+      transition: background 0.3s, box-shadow 0.3s;
+    }
+    .status-dot.connected  { background: var(--green); box-shadow: 0 0 8px var(--green); }
+    .status-dot.listening  { background: var(--accent); box-shadow: 0 0 10px var(--accent-glow); animation: pulse 1s ease-in-out infinite; }
+    .status-dot.thinking   { background: #f7c26a; box-shadow: 0 0 10px rgba(247,194,106,0.4); }
+    .status-dot.speaking   { background: var(--green); box-shadow: 0 0 10px rgba(61,255,160,0.3); animation: pulse 0.6s ease-in-out infinite; }
+    .status-dot.error      { background: var(--red); }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0.4; }
+    }
+
+    main {
+      flex: 1;
+      display: flex;
+      gap: 0;
+      overflow: hidden;
+    }
+
+    .transcript-panel {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      border-right: 1px solid var(--border);
+      overflow: hidden;
+    }
+    .panel-label {
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      color: var(--muted);
+      padding: 14px 24px 10px;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    .messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 20px 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      scroll-behavior: smooth;
+    }
+    .messages::-webkit-scrollbar { width: 4px; }
+    .messages::-webkit-scrollbar-track { background: transparent; }
+    .messages::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+    .message {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      animation: fadeUp 0.25s ease;
+    }
+    @keyframes fadeUp {
+      from { opacity: 0; transform: translateY(8px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    .message-role {
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: 1.5px;
+      text-transform: uppercase;
+    }
+    .message.user .message-role { color: var(--accent); }
+    .message.ai   .message-role { color: var(--green); }
+    .message-text {
+      font-size: 15px;
+      line-height: 1.65;
+      font-weight: 300;
+      color: var(--text);
+    }
+    .message.ai .message-text { font-style: italic; }
+
+    .cursor {
+      display: inline-block;
+      width: 2px; height: 1em;
+      background: var(--green);
+      margin-left: 2px;
+      vertical-align: text-bottom;
+      animation: blink 0.8s step-start infinite;
+    }
+    @keyframes blink { 50% { opacity: 0; } }
+
+    .side-panel {
+      width: 280px;
+      display: flex;
+      flex-direction: column;
+      flex-shrink: 0;
+    }
+
+    .waveform-section {
+      padding: 20px;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    .waveform-label {
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: 2px;
+      color: var(--muted);
+      text-transform: uppercase;
+      margin-bottom: 12px;
+    }
+    canvas#waveform {
+      width: 100%;
+      height: 64px;
+      border-radius: 6px;
+      background: var(--surface);
+    }
+
+    .stats-section {
+      padding: 20px;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    .stat-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 6px 0;
+      border-bottom: 1px solid var(--border);
+      font-size: 12px;
+    }
+    .stat-row:last-child { border-bottom: none; }
+    .stat-key { color: var(--muted); font-family: var(--mono); font-size: 10px; letter-spacing: 1px; }
+    .stat-val { color: var(--text); font-family: var(--mono); font-size: 11px; }
+    .stat-val.good { color: var(--green); }
+    .stat-val.warn { color: #f7c26a; }
+    .stat-val.bad  { color: var(--red); }
+
+    .controls {
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      margin-top: auto;
+    }
+    .btn-mic {
+      width: 100%;
+      padding: 16px;
+      border: none;
+      border-radius: 10px;
+      background: var(--accent);
+      color: #fff;
+      font-family: var(--mono);
+      font-size: 12px;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      cursor: pointer;
+      transition: background 0.2s, transform 0.1s, box-shadow 0.2s;
+    }
+    .btn-mic:hover  { background: #9585ff; box-shadow: 0 0 20px var(--accent-glow); }
+    .btn-mic:active { transform: scale(0.97); }
+    .btn-mic.active {
+      background: var(--red);
+      box-shadow: 0 0 20px rgba(255,95,95,0.35);
+      animation: micPulse 1.5s ease-in-out infinite;
+    }
+    @keyframes micPulse {
+      0%, 100% { box-shadow: 0 0 10px rgba(255,95,95,0.3); }
+      50%       { box-shadow: 0 0 30px rgba(255,95,95,0.6); }
+    }
+    .btn-reset {
+      width: 100%;
+      padding: 10px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: transparent;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      cursor: pointer;
+      transition: color 0.2s, border-color 0.2s;
+    }
+    .btn-reset:hover { color: var(--text); border-color: var(--muted); }
+
+    .ws-config {
+      padding: 0 20px 16px;
+      flex-shrink: 0;
+    }
+    .ws-config label {
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: 1px;
+      color: var(--muted);
+      text-transform: uppercase;
+      display: block;
+      margin-bottom: 6px;
+    }
+    .ws-config input {
+      width: 100%;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 10px;
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 11px;
+      outline: none;
+    }
+    .ws-config input:focus { border-color: var(--accent); }
+
+    .empty-state {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      color: var(--muted);
+      font-size: 13px;
+      gap: 8px;
+    }
+    .empty-state svg { opacity: 0.3; }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="logo">VoiceAI // SniperThink</div>
+  <div class="status-pill">
+    <div class="status-dot" id="statusDot"></div>
+    <span id="statusText">DISCONNECTED</span>
+  </div>
+</header>
+
+<main>
+  <section class="transcript-panel">
+    <div class="panel-label">// conversation</div>
+    <div class="messages" id="messages">
+      <div class="empty-state" id="emptyState">
+        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <path d="M12 2a3 3 0 0 1 3 3v7a3 3 0 0 1-6 0V5a3 3 0 0 1 3-3z"/>
+          <path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v3M8 22h8"/>
+        </svg>
+        <span>Press connect, then start speaking</span>
+      </div>
+    </div>
+  </section>
+
+  <aside class="side-panel">
+    <div class="panel-label">// audio monitor</div>
+
+    <div class="waveform-section">
+      <div class="waveform-label">Input Waveform</div>
+      <canvas id="waveform" width="240" height="64"></canvas>
+    </div>
+
+    <div class="stats-section">
+      <div class="panel-label" style="padding:0 0 10px; border:none">// latency</div>
+      <div class="stat-row">
+        <span class="stat-key">STT</span>
+        <span class="stat-val" id="stat-stt">—</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-key">LLM First Token</span>
+        <span class="stat-val" id="stat-llm">—</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-key">End-to-End</span>
+        <span class="stat-val" id="stat-e2e">—</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-key">Messages</span>
+        <span class="stat-val" id="stat-msgs">0</span>
+      </div>
+    </div>
+
+    <div class="ws-config">
+      <label>WebSocket URL</label>
+      <input type="text" id="wsUrl" value="ws://localhost:8765" />
+    </div>
+
+    <div class="controls">
+      <button class="btn-mic" id="connectBtn" onclick="toggleConnection()">
+        Connect
+      </button>
+      <button class="btn-reset" onclick="resetConversation()">
+        Reset Conversation
+      </button>
+    </div>
+  </aside>
+</main>
+
+<script>
+/* ═══════════════════════════════════════════════════════════
+   Voice AI Client
+
+   Audio capture:
+     getUserMedia → AudioContext → ScriptProcessor → Int16 PCM → WebSocket
+
+   Audio playback (Web Audio API — instantly stoppable):
+     WebSocket binary (WAV) → decodeAudioData → AudioBufferSourceNode
+     source.stop() cuts playback immediately at hardware level
+
+   Interruption:
+     Mic RMS > threshold while AI speaking
+     → stopAudioNow() kills current AudioBufferSourceNode instantly
+     → sends interrupt to backend
+     → backend kills TTS subprocess + stops LLM stream
+   ═══════════════════════════════════════════════════════════ */
+
+const SAMPLE_RATE = 16000;
+const CHUNK_SIZE  = 4096;   // power of 2, ~256ms at 16kHz
+
+// ─── State ──────────────────────────────────────────────────
+let ws             = null;
+let audioContext   = null;   // mic AudioContext (16kHz)
+let micStream      = null;
+let scriptProcessor = null;
+let analyserNode   = null;
+let isConnected    = false;
+let isMicActive    = false;
+let isAISpeaking   = false;
+let messageCount   = 0;
+
+// UI message state
+let currentAiMsgEl = null;
+let currentAiText  = "";
+let turnStartTime  = null;
+let lastInterrupt = 0;
+
+// ─── Web Audio API playback ──────────────────────────────────
+// Using Web Audio API instead of <audio> element because
+// AudioBufferSourceNode.stop() is instant and reliable —
+// unlike <audio>.pause() which can leave buffered audio playing.
+let playbackContext = null;   // separate AudioContext for playback
+let audioQueue      = [];     // pending AudioBuffer objects
+let isPlaying       = false;
+let audioStopped    = false;
+let currentSource   = null;   // currently playing AudioBufferSourceNode
+
+function getPlaybackContext() {
+  // Lazy-init so it's created after a user gesture (Chrome autoplay policy)
+  if (!playbackContext || playbackContext.state === 'closed') {
+    playbackContext = new AudioContext();
+  }
+  if (playbackContext.state === 'suspended') {
+    playbackContext.resume();
+  }
+  return playbackContext;
+}
+
+function stopAudioNow() {
+  audioStopped = true;
+  isPlaying    = false;
+
+  // Stop the currently playing source node immediately
+  // AudioBufferSourceNode.stop() is a hardware-level stop —
+  // no buffered audio continues after this call
+  if (currentSource) {
+    try {
+      currentSource.onended = null;  // prevent playNext from being called
+      currentSource.stop();
+      currentSource.disconnect();
+    } catch(e) {
+      // already stopped — safe to ignore
+    }
+    currentSource = null;
+  }
+
+  // Discard all queued audio buffers
+  audioQueue = [];
+}
+
+async function handleAudioChunk(bytes) {
+  if (audioStopped) return;
+
+  try {
+    const ctx = getPlaybackContext();
+    // Copy the buffer — decodeAudioData detaches the original
+    const arrayBuffer = bytes.buffer.slice(
+      bytes.byteOffset,
+      bytes.byteOffset + bytes.byteLength
+    );
+    const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
+
+    if (audioStopped) return;   // may have been interrupted during decode
+
+    audioQueue.push(audioBuffer);
+    if (!isPlaying) playNext();
+
+  } catch(e) {
+    console.error("Audio decode error:", e);
+  }
+}
+
+function playNext() {
+  if (audioStopped || audioQueue.length === 0) {
+    isPlaying     = false;
+    currentSource = null;
+    return;
+  }
+
+  isPlaying = true;
+  const audioBuffer = audioQueue.shift();
+  const ctx = getPlaybackContext();
+
+  const source = ctx.createBufferSource();
+  source.buffer = audioBuffer;
+  source.connect(ctx.destination);
+  currentSource = source;
+
+  // When this sentence ends, play the next one
+  source.onended = () => {
+    if (currentSource === source) currentSource = null;
+    playNext();
+  };
+
+  source.start(0);
+}
+
+// ─── WebSocket ───────────────────────────────────────────────
+function toggleConnection() {
+  isConnected ? disconnect() : connect();
+}
+
+function connect() {
+  const url = document.getElementById("wsUrl").value.trim();
+  setStatus("connecting", "CONNECTING");
+
+  try {
+    ws = new WebSocket(url);
+    ws.binaryType = "arraybuffer";
+  } catch(e) {
+    setStatus("error", "INVALID URL");
+    return;
+  }
+
+  ws.onopen = async () => {
+    isConnected = true;
+    // Initialise playback context on user gesture
+    getPlaybackContext();
+    setStatus("connected", "CONNECTED");
+    document.getElementById("connectBtn").textContent = "Disconnect";
+    document.getElementById("connectBtn").classList.remove("active");
+    await startMic();
+  };
+
+  ws.onmessage = (event) => {
+    if (event.data instanceof ArrayBuffer) {
+      handleAudioChunk(new Uint8Array(event.data));
+    } else {
+      try { handleControlMessage(JSON.parse(event.data)); } catch(e) {}
+    }
+  };
+
+  ws.onerror = () => setStatus("error", "ERROR");
+
+  ws.onclose = () => {
+    isConnected = false;
+    stopMic();
+    setStatus("disconnected", "DISCONNECTED");
+    document.getElementById("connectBtn").textContent = "Connect";
+    document.getElementById("connectBtn").classList.remove("active");
+  };
+}
+
+function disconnect() {
+  stopAudioNow();
+  if (ws) { ws.close(); ws = null; }
+  stopMic();
+}
+
+// ─── Control messages ────────────────────────────────────────
+function handleControlMessage(msg) {
+  switch (msg.type) {
+
+    case "status":
+      if (msg.session_id)
+        setStatus("connected", `SESSION ${msg.session_id}`);
+      break;
+
+    case "transcript":
+      finishAiMessage();
+      appendMessage("user", msg.text);
+      setStatus("listening", "PROCESSING");
+      updateStat("stat-stt", msg.latency_ms, 500, 1000);
+      turnStartTime = performance.now();
+      break;
+
+    case "turn_start":
+      isAISpeaking  = true;
+      audioStopped  = false;   // ready to receive new audio
+      setStatus("speaking", "AI SPEAKING");
+      currentAiText  = "";
+      currentAiMsgEl = appendMessage("ai", "");
+      break;
+
+    case "ai_text":
+      if (currentAiMsgEl) {
+        currentAiText += msg.token;
+        updateStreamingMessage(currentAiMsgEl, currentAiText);
+      }
+      break;
+
+    case "turn_end":
+      isAISpeaking = false;
+      finishAiMessage();
+      setStatus("connected", "LISTENING");
+      if (turnStartTime && msg.total_latency_ms)
+        updateStat("stat-e2e", msg.total_latency_ms, 1500, 3000);
+      document.getElementById("stat-msgs").textContent = ++messageCount;
+      break;
+
+    case "interrupted":
+      isAISpeaking = false;
+      stopAudioNow();
+      finishAiMessage();
+      setStatus("listening", "INTERRUPTED");
+      break;
+
+    case "latency":
+      if (msg.llm_first_token_ms)
+        updateStat("stat-llm", msg.llm_first_token_ms, 600, 1200);
+      break;
+
+    case "error":
+      appendSystemMsg("Error: " + msg.message);
+      break;
+  }
+}
+
+// ─── Microphone ──────────────────────────────────────────────
+async function startMic() {
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount:    1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl:  true,
+      }
+    });
+
+    // Capture context at 16kHz — device resamples automatically
+    audioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
+    const source = audioContext.createMediaStreamSource(micStream);
+
+    analyserNode = audioContext.createAnalyser();
+    analyserNode.fftSize = 256;
+    source.connect(analyserNode);
+
+    scriptProcessor = audioContext.createScriptProcessor(CHUNK_SIZE, 1, 1);
+    source.connect(scriptProcessor);
+    scriptProcessor.connect(audioContext.destination);
+
+    scriptProcessor.onaudioprocess = (event) => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+      const float32 = event.inputBuffer.getChannelData(0);
+
+      // Interruption detection — runs every ~256ms
+      if (isAISpeaking || isPlaying) {
+        const rms = Math.sqrt(
+          float32.reduce((s, v) => s + v * v, 0) / float32.length
+        );
+        if (rms > 0.015) {
+          const now = Date.now();
+          if (now - lastInterrupt > 500) {   // prevent interrupt spam
+            lastInterrupt = now;
+            stopAudioNow();
+            isAISpeaking = false;
+            setStatus("listening", "INTERRUPTED");
+            finishAiMessage();
+            ws.send(JSON.stringify({ type: "interrupt" }));
+          }
+        }
+      }
+
+      // Convert float32 PCM → int16 and send to backend
+      const int16 = new Int16Array(float32.length);
+      for (let i = 0; i < float32.length; i++) {
+        int16[i] = Math.max(-32768, Math.min(32767, float32[i] * 32768));
+      }
+      ws.send(int16.buffer);
+    };
+
+    isMicActive = true;
+    document.getElementById("connectBtn").classList.add("active");
+    document.getElementById("connectBtn").textContent = "Disconnect";
+    setStatus("listening", "LISTENING");
+    drawWaveform();
+
+  } catch(e) {
+    console.error("Mic error:", e.name, e.message);
+    setStatus("error", "MIC ERROR");
+    appendSystemMsg(`Mic error: ${e.name} — ${e.message}`);
+  }
+}
+
+function stopMic() {
+  if (scriptProcessor) { scriptProcessor.disconnect(); scriptProcessor = null; }
+  if (micStream)       { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+  if (audioContext)    { audioContext.close(); audioContext = null; }
+  isMicActive = false;
+}
+
+// ─── Waveform visualisation ───────────────────────────────────
+function drawWaveform() {
+  if (!analyserNode) return;
+  const canvas = document.getElementById("waveform");
+  const ctx    = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height;
+  const dataArray = new Uint8Array(analyserNode.frequencyBinCount);
+
+  (function draw() {
+    requestAnimationFrame(draw);
+    if (!analyserNode) return;
+
+    analyserNode.getByteTimeDomainData(dataArray);
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = "#12121a";
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.lineWidth   = 1.5;
+    ctx.strokeStyle = isAISpeaking ? "#3dffa0" : "#7c6af7";
+    ctx.beginPath();
+
+    const sliceWidth = W / dataArray.length;
+    let x = 0;
+    for (let i = 0; i < dataArray.length; i++) {
+      const y = (dataArray[i] / 128.0) * H / 2;
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+      x += sliceWidth;
+    }
+    ctx.lineTo(W, H / 2);
+    ctx.stroke();
+  })();
+}
+
+// ─── UI helpers ───────────────────────────────────────────────
+function setStatus(state, text) {
+  document.getElementById("statusDot").className  = "status-dot " + state;
+  document.getElementById("statusText").textContent = text;
+}
+
+function appendMessage(role, text) {
+  const empty = document.getElementById("emptyState");
+  if (empty) empty.remove();
+
+  const messages = document.getElementById("messages");
+  const div = document.createElement("div");
+  div.className = `message ${role}`;
+  div.innerHTML = `
+    <div class="message-role">${role === "user" ? "// you" : "// ai"}</div>
+    <div class="message-text">${escapeHtml(text)}${role === "ai" ? '<span class="cursor"></span>' : ""}</div>
+  `;
+  messages.appendChild(div);
+  messages.scrollTop = messages.scrollHeight;
+  return div;
+}
+
+function updateStreamingMessage(el, text) {
+  const textEl = el.querySelector(".message-text");
+  if (textEl) textEl.innerHTML = escapeHtml(text) + '<span class="cursor"></span>';
+  document.getElementById("messages").scrollTop = 9999;
+}
+
+function finishAiMessage() {
+  if (currentAiMsgEl) {
+    const textEl = currentAiMsgEl.querySelector(".message-text");
+    if (textEl) textEl.innerHTML = escapeHtml(currentAiText);
+    currentAiMsgEl = null;
+    currentAiText  = "";
+  }
+}
+
+function appendSystemMsg(text) {
+  const messages = document.getElementById("messages");
+  const div = document.createElement("div");
+  div.style.cssText = "color:#6b6b80;font-size:12px;font-family:var(--mono);padding:4px 0";
+  div.textContent = `// ${text}`;
+  messages.appendChild(div);
+  messages.scrollTop = messages.scrollHeight;
+}
+
+function updateStat(id, ms, warnMs, badMs) {
+  const el = document.getElementById(id);
+  if (!el || ms == null) return;
+  const val = Math.round(ms);
+  el.textContent = `${val}ms`;
+  el.className = "stat-val " + (val < warnMs ? "good" : val < badMs ? "warn" : "bad");
+}
+
+function resetConversation() {
+  if (ws && ws.readyState === WebSocket.OPEN)
+    ws.send(JSON.stringify({ type: "reset" }));
+
+  document.getElementById("messages").innerHTML = `
+    <div class="empty-state" id="emptyState">
+      <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+        <path d="M12 2a3 3 0 0 1 3 3v7a3 3 0 0 1-6 0V5a3 3 0 0 1 3-3z"/>
+        <path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v3M8 22h8"/>
+      </svg>
+      <span>Conversation reset</span>
+    </div>`;
+  messageCount = 0;
+  document.getElementById("stat-msgs").textContent = "0";
+}
+
+function escapeHtml(t) {
+  return String(t)
+    .replace(/&/g,"&amp;").replace(/</g,"&lt;")
+    .replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+}
+</script>
+</body>
+</html>

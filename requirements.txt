@@ -1,0 +1,20 @@
+# WebSocket server
+websockets>=12.0
+
+# Free cloud APIs — STT + LLM (Groq free tier)
+groq>=0.9.0
+
+# Free TTS — Microsoft Edge Neural voices (no API key needed)
+# edge-tts>=6.1.9
+
+# Local TTS — uses OS built-in engine, no API key or download needed
+pyttsx3>=2.90
+
+# Free local embeddings for RAG (no API key needed)
+sentence-transformers>=3.0.0
+
+# Numerics
+numpy>=1.26.0
+
+# Environment variables
+python-dotenv>=1.0.0
