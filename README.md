@@ -282,3 +282,33 @@ cached permanently after that.
 | `GROQ_API_KEY` | Yes | Free at console.groq.com |
 | `HOST` | No (default: `0.0.0.0`) | WebSocket bind host |
 | `PORT` | No (default: `8765`) | WebSocket port |
+
+---
+
+## Future Improvements
+
+While the current system focuses on architectural clarity and low latency,
+several improvements could be explored in a production setting:
+
+- Replace `ScriptProcessor` with **AudioWorklet** for lower audio latency
+- Add **streaming STT** instead of full-utterance transcription
+- Use **neural TTS** (OpenAI TTS / Coqui / ElevenLabs) for more natural speech
+- Deploy the backend **closer to inference infrastructure** to reduce network latency
+- Persist RAG embeddings in a **vector database** (FAISS / Qdrant / Pinecone)
+- Add **WebRTC transport** for large-scale real-time deployments
+
+---
+
+## Author
+
+**Syed Daanyal Pasha**
+
+This project was developed as part of a technical evaluation for a
+Real-Time Voice AI Engineering role, with the goal of demonstrating
+system design, streaming architectures, and latency optimization.
+
+---
+
+## License
+
+This project is provided for evaluation and educational purposes.
