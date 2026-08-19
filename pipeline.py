@@ -4,9 +4,9 @@ VoicePipeline: Orchestrates the full STT → LLM → TTS loop.
 Design:
   - Audio chunks arrive over WebSocket
   - A VAD (energy-based) detects speech start/end
-  - On end-of-speech, audio is sent to STT (Whisper via OpenAI API)
-  - Transcript goes to LLM (GPT-4o streaming)
-  - LLM tokens are streamed to TTS (OpenAI TTS streaming)
+  - On end-of-speech, audio is sent to STT (Groq Whisper whisper-large-v3-turbo)
+  - Transcript goes to LLM (Groq llama-3.3-70b-versatile)
+  - LLM tokens are streamed to TTS (local pyttsx3 subprocess)
   - TTS audio chunks are sent back over WebSocket
   - Interruption: user speaking while AI is talking cancels current TTS stream
 """
@@ -17,6 +17,7 @@ import logging
 import time
 from typing import Optional
 
+# pyrefly: ignore [missing-import]
 import numpy as np
 
 from stt import transcribe_audio
@@ -245,19 +246,6 @@ class VoicePipeline:
 
         finally:
             self._ai_speaking = False
-
-    async def _send_tts_for_sentence(self, sentence: str):
-        """Stream TTS audio chunks for a single sentence."""
-        # Check interrupt BEFORE starting synthesis , skip sentence entirely
-        if self._interrupt_event.is_set():
-            return
-        try:
-            async for audio_chunk in stream_tts_audio(sentence, session_id=self.session_id):
-                if self._interrupt_event.is_set():
-                    return
-                await self.websocket.send(audio_chunk)
-        except Exception as e:
-            logger.error(f"[{self.session_id}] TTS error: {e}")
 
     async def _send_tts_for_sentence(self, sentence: str):
         """Stream TTS audio chunks for a single sentence."""
