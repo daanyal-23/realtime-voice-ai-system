@@ -14,6 +14,7 @@ venv/
 .env/
 .venv/
 env/
+*.zip
 
 # Build / distribution files
 dist/
