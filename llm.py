@@ -5,7 +5,7 @@ Features:
   - Token streaming for low first-audio latency
   - Fallback from primary to secondary model on failure or empty completion
   - Handling of reasoning-only deltas for GPT-OSS models
-  - Configurable timeouts and completion token limits
+  - Configurable timeouts (TTFT timeout and inter-chunk idle timeout)
   - Isolated first-content-token latency measurement
   - System prompt tuned for voice (no markdown, concise)
   - Optional RAG context injection
@@ -25,6 +25,7 @@ from config import (
     LLM_MAX_COMPLETION_TOKENS,
     LLM_MODEL,
     LLM_REASONING_EFFORT,
+    LLM_STREAM_IDLE_TIMEOUT_S,
     LLM_TEMPERATURE,
     LLM_TIMEOUT_S,
 )
@@ -120,8 +121,9 @@ async def stream_llm_response(
             logger.info(f"[{session_id}] Selected LLM model: {model}")
 
         t_start = time.perf_counter()
-        first_token_logged = False
         token_count = 0
+        first_token_received = False
+        stream_iter = None
 
         create_kwargs = {
             "model": model,
@@ -134,40 +136,87 @@ async def stream_llm_response(
         if _is_gpt_oss_model(model):
             create_kwargs["reasoning_effort"] = LLM_REASONING_EFFORT
 
+        # Phase 1: Bounded by LLM_TIMEOUT_S (Time-to-first-content-token)
         try:
             async with asyncio.timeout(LLM_TIMEOUT_S):
                 stream = await active_client.chat.completions.create(**create_kwargs)
-                async for chunk in stream:
+                stream_iter = stream.__aiter__()
+                while not first_token_received:
+                    try:
+                        chunk = await anext(stream_iter)
+                    except StopAsyncIteration:
+                        break
+
                     if not chunk.choices:
                         continue
+
                     delta = chunk.choices[0].delta
                     content = getattr(delta, "content", None)
                     if content:
-                        if not first_token_logged:
-                            latency_ms = (time.perf_counter() - t_start) * 1000
-                            logger.info(
-                                f"[{session_id}] Isolated first-content-token latency for {model}: {latency_ms:.1f}ms"
-                            )
-                            first_token_logged = True
+                        first_token_received = True
+                        latency_ms = (time.perf_counter() - t_start) * 1000
+                        logger.info(
+                            f"[{session_id}] Isolated first-content-token latency for {model}: {latency_ms:.1f}ms"
+                        )
                         token_count += 1
                         yield content
 
-            if token_count > 0:
-                # Successfully streamed content tokens
-                return
-            else:
-                logger.warning(f"[{session_id}] Model {model} produced 0 content tokens")
-
         except TimeoutError:
-            logger.warning(f"[{session_id}] Model {model} timed out after {LLM_TIMEOUT_S}s")
-            if token_count > 0:
-                raise LLMError(f"Model {model} timed out mid-stream after yielding {token_count} tokens")
-        except Exception as e:
-            logger.warning(f"[{session_id}] Model {model} failed: {type(e).__name__}: {e}")
-            if token_count > 0:
-                raise LLMError(f"Model {model} failed mid-stream after yielding {token_count} tokens: {e}") from e
+            logger.warning(
+                f"[{session_id}] Model {model} timed out waiting for first content token after {LLM_TIMEOUT_S}s"
+            )
+            # 0 tokens yielded -> continue to fallback
+            continue
+        except (Exception, asyncio.CancelledError) as e:
+            if isinstance(e, asyncio.CancelledError):
+                raise
+            logger.warning(
+                f"[{session_id}] Model {model} failed before first content token: {type(e).__name__}: {e}"
+            )
+            # 0 tokens yielded -> continue to fallback
+            continue
 
-    # Both primary and fallback models failed
+        # If stream closed without yielding any content (e.g. empty or reasoning only)
+        if not first_token_received:
+            logger.warning(f"[{session_id}] Model {model} produced 0 content tokens")
+            # 0 tokens yielded -> continue to fallback
+            continue
+
+        # Phase 2: Stream remaining chunks bounded by LLM_STREAM_IDLE_TIMEOUT_S between chunks
+        # Once content was already yielded, never start fallback (to prevent duplicate answer)
+        if stream_iter is not None:
+            while True:
+                try:
+                    async with asyncio.timeout(LLM_STREAM_IDLE_TIMEOUT_S):
+                        chunk = await anext(stream_iter)
+                except StopAsyncIteration:
+                    # Stream completed normally
+                    return
+                except TimeoutError:
+                    logger.warning(
+                        f"[{session_id}] Model {model} stream idle timeout after {LLM_STREAM_IDLE_TIMEOUT_S}s between chunks. Ending stream without fallback."
+                    )
+                    return
+                except (Exception, asyncio.CancelledError) as e:
+                    if isinstance(e, asyncio.CancelledError):
+                        raise
+                    logger.warning(
+                        f"[{session_id}] Model {model} failed mid-stream after yielding {token_count} tokens: {type(e).__name__}: {e}. Ending stream without fallback."
+                    )
+                    return
+
+                if not chunk.choices:
+                    continue
+
+                delta = chunk.choices[0].delta
+                content = getattr(delta, "content", None)
+                if content:
+                    token_count += 1
+                    yield content
+
+            return
+
+    # If both primary and fallback models produced no content
     logger.error(
         f"[{session_id}] Both primary ({LLM_MODEL}) and fallback ({LLM_FALLBACK_MODEL}) models failed to generate content"
     )

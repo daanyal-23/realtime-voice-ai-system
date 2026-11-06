@@ -41,6 +41,7 @@ Features demonstrated:
 
 ## Requirements
 
+Requires Python 3.11+
 - Python 3.9+
 - Google Chrome (for microphone access)
 - Internet connection (for Groq STT and LLM APIs)

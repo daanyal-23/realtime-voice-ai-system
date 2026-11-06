@@ -4,11 +4,13 @@ Tests token streaming, reasoning delta filtering, fallback logic, error states, 
 """
 
 import asyncio
+import importlib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import config
 from config import LLM_FALLBACK_MODEL, LLM_MODEL
 from llm import LLMError, _is_gpt_oss_model, stream_llm_response
 
@@ -23,9 +25,10 @@ def make_chunk(content=None, reasoning=None):
 class MockAsyncStream:
     """Async iterator simulating Groq API chunk stream."""
 
-    def __init__(self, chunks, delay=0.0):
+    def __init__(self, chunks, delay=0.0, raise_after=None):
         self.chunks = list(chunks)
         self.delay = delay
+        self.raise_after = raise_after
         self.idx = 0
 
     def __aiter__(self):
@@ -34,6 +37,8 @@ class MockAsyncStream:
     async def __anext__(self):
         if self.delay > 0:
             await asyncio.sleep(self.delay)
+        if self.raise_after is not None and self.idx >= self.raise_after:
+            raise Exception(f"Simulated mid-stream failure after {self.idx} chunks")
         if self.idx >= len(self.chunks):
             raise StopAsyncIteration
         chunk = self.chunks[self.idx]
@@ -93,12 +98,11 @@ class TestLLMStreaming:
         ]
 
         assert tokens == ["Welcome", " to the clinic."]
-        # Ensure reasoning text was never leaked into yielded tokens
         assert not any("Analyzing" in t or "Deciding" in t for t in tokens)
 
     @pytest.mark.asyncio
-    async def test_primary_model_exception_triggers_fallback(self):
-        """An exception in the primary model triggers the configured fallback model."""
+    async def test_primary_model_exception_triggers_fallback_when_no_content(self):
+        """An exception in the primary model before any content triggers the fallback model."""
         mock_client = MagicMock()
 
         fallback_chunks = [
@@ -106,7 +110,6 @@ class TestLLMStreaming:
             make_chunk(content=" answer"),
         ]
 
-        # Primary raises error, fallback succeeds
         mock_client.chat.completions.create = AsyncMock(
             side_effect=[
                 Exception("Model temporarily overloaded 503"),
@@ -134,7 +137,6 @@ class TestLLMStreaming:
         """When primary model produces 0 content tokens, fallback model is invoked."""
         mock_client = MagicMock()
 
-        # Primary yields only reasoning / empty content
         empty_chunks = [
             make_chunk(content=None, reasoning="Internal thoughts only..."),
         ]
@@ -163,8 +165,93 @@ class TestLLMStreaming:
         assert mock_client.chat.completions.create.call_args_list[1].kwargs["model"] == LLM_FALLBACK_MODEL
 
     @pytest.mark.asyncio
+    async def test_primary_fails_after_content_yielded_ends_stream_without_fallback(self):
+        """If primary fails after content was already yielded, stream ends without fallback."""
+        mock_client = MagicMock()
+
+        # Stream yields one token, then raises an exception on chunk 2
+        chunks = [
+            make_chunk(content="Partial answer"),
+            make_chunk(content=" never reached"),
+        ]
+        mock_client.chat.completions.create = AsyncMock(
+            return_value=MockAsyncStream(chunks, raise_after=1)
+        )
+
+        history = [{"role": "user", "content": "Continue answer"}]
+        tokens = [
+            t
+            async for t in stream_llm_response(
+                history, session_id="test", use_rag=False, client=mock_client
+            )
+        ]
+
+        # Partial token received; stream gracefully closed without calling fallback
+        assert tokens == ["Partial answer"]
+        assert mock_client.chat.completions.create.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_primary_idle_timeout_after_content_yielded_ends_stream_without_fallback(self):
+        """If gap between chunks exceeds LLM_STREAM_IDLE_TIMEOUT_S after content was yielded, stream ends without fallback."""
+        mock_client = MagicMock()
+
+        chunks = [
+            make_chunk(content="First sentence."),
+            make_chunk(content="Second sentence delayed."),
+        ]
+        # Delay 0.3s between chunks
+        mock_client.chat.completions.create = AsyncMock(
+            return_value=MockAsyncStream(chunks, delay=0.3)
+        )
+
+        history = [{"role": "user", "content": "Explain"}]
+        # Set idle timeout to 0.05s so delay of 0.3s triggers idle timeout
+        with patch("llm.LLM_STREAM_IDLE_TIMEOUT_S", 0.05):
+            tokens = [
+                t
+                async for t in stream_llm_response(
+                    history, session_id="test", use_rag=False, client=mock_client
+                )
+            ]
+
+        # Yielded the first token, timed out waiting for the second, ended without fallback
+        assert tokens == ["First sentence."]
+        assert mock_client.chat.completions.create.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_healthy_long_stream_not_cut_by_initial_timeout(self):
+        """A healthy long response is never cut by LLM_TIMEOUT_S as long as idle gaps stay low."""
+        mock_client = MagicMock()
+
+        # 4 chunks, each taking 0.02s -> total duration ~0.08s
+        chunks = [
+            make_chunk(content="Part 1 "),
+            make_chunk(content="Part 2 "),
+            make_chunk(content="Part 3 "),
+            make_chunk(content="Part 4"),
+        ]
+        mock_client.chat.completions.create = AsyncMock(
+            return_value=MockAsyncStream(chunks, delay=0.02)
+        )
+
+        history = [{"role": "user", "content": "Give a detailed response"}]
+        # Set initial TTFT timeout to 0.04s (first token arrives in 0.02s < 0.04s)
+        # Total duration is ~0.08s > 0.04s, but idle timeout is 0.5s > 0.02s
+        with patch("llm.LLM_TIMEOUT_S", 0.04), patch("llm.LLM_STREAM_IDLE_TIMEOUT_S", 0.5):
+            tokens = [
+                t
+                async for t in stream_llm_response(
+                    history, session_id="test", use_rag=False, client=mock_client
+                )
+            ]
+
+        # All 4 tokens yielded successfully without being cut off by LLM_TIMEOUT_S
+        assert tokens == ["Part 1 ", "Part 2 ", "Part 3 ", "Part 4"]
+        assert mock_client.chat.completions.create.call_count == 1
+
+    @pytest.mark.asyncio
     async def test_both_models_failing_produces_identifiable_error_state(self):
-        """When both primary and fallback fail, LLMError is raised (no fake apologies)."""
+        """When both primary and fallback fail with no content, LLMError is raised."""
         mock_client = MagicMock()
         mock_client.chat.completions.create = AsyncMock(
             side_effect=[
@@ -184,11 +271,10 @@ class TestLLMStreaming:
         assert mock_client.chat.completions.create.call_count == 2
 
     @pytest.mark.asyncio
-    async def test_timeout_is_handled_correctly(self):
-        """Timeout on primary triggers fallback to secondary model."""
+    async def test_timeout_before_first_content_triggers_fallback(self):
+        """Timeout on primary before first content token triggers fallback to secondary model."""
         mock_client = MagicMock()
 
-        # Primary hangs (delay 0.5s with timeout 0.05s)
         hanging_stream = MockAsyncStream(
             [make_chunk(content="Late")], delay=0.5
         )
@@ -224,3 +310,11 @@ class TestGPTOSSModelHelper:
         assert _is_gpt_oss_model("GPT-OSS-test") is True
         assert _is_gpt_oss_model("llama-3.3-70b-versatile") is False
         assert _is_gpt_oss_model("llama-3.1-8b-instant") is False
+
+
+class TestConfig:
+    def test_config_calls_load_dotenv(self):
+        """Ensure config.py calls load_dotenv() upon import."""
+        with patch("dotenv.load_dotenv") as mock_load_dotenv:
+            importlib.reload(config)
+            mock_load_dotenv.assert_called()
