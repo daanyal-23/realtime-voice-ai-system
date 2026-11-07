@@ -11,11 +11,34 @@ import io
 import logging
 import wave
 
+from typing import Optional
+
 import numpy as np
 from groq import AsyncGroq
 
 logger = logging.getLogger("stt")
-client = AsyncGroq()
+
+# Lazily initialized client instance
+_client: Optional[AsyncGroq] = None
+
+
+def get_client() -> AsyncGroq:
+    """Lazily initialize and return AsyncGroq client."""
+    global _client
+    if _client is None:
+        try:
+            _client = AsyncGroq(max_retries=0)
+        except TypeError:
+            logger.warning("Groq SDK does not support max_retries parameter")
+            _client = AsyncGroq()
+    return _client
+
+
+def __getattr__(name: str):
+    """Provide lazy access to module-level client without instantiating at import time."""
+    if name == "client":
+        return get_client()
+    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
 SAMPLE_RATE = 16000
 SILENCE_THRESHOLD = 0.01   # RMS below this = silence
@@ -86,7 +109,8 @@ async def transcribe_audio(pcm_data: bytes, session_id: str = "") -> str:
     audio_file.name = "audio.wav"
 
     try:
-        response = await client.audio.transcriptions.create(
+        active_client = get_client()
+        response = await active_client.audio.transcriptions.create(
             model="whisper-large-v3-turbo",
             file=audio_file,
             response_format="text",

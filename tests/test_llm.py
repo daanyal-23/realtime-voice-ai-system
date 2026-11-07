@@ -30,6 +30,7 @@ class MockAsyncStream:
         self.delay = delay
         self.raise_after = raise_after
         self.idx = 0
+        self.is_closed = False
 
     def __aiter__(self):
         return self
@@ -44,6 +45,12 @@ class MockAsyncStream:
         chunk = self.chunks[self.idx]
         self.idx += 1
         return chunk
+
+    async def aclose(self):
+        self.is_closed = True
+
+    def close(self):
+        self.is_closed = True
 
 
 class TestLLMStreaming:
@@ -300,6 +307,136 @@ class TestLLMStreaming:
 
         assert tokens == ["On", " time"]
         assert mock_client.chat.completions.create.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_slow_consumer_after_first_token_not_cancelled(self):
+        """A consumer slower than LLM_TIMEOUT_S after receiving the first token is not cancelled."""
+        mock_client = MagicMock()
+        mock_stream = MockAsyncStream(
+            [
+                make_chunk(content="First"),
+                make_chunk(content="Second"),
+            ],
+            delay=0.01,
+        )
+        mock_client.chat.completions.create = AsyncMock(return_value=mock_stream)
+
+        history = [{"role": "user", "content": "Hello"}]
+        tokens = []
+        # Set TTFT timeout very short (0.05s) and idle timeout generous (1.0s)
+        with patch("llm.LLM_TIMEOUT_S", 0.05), patch("llm.LLM_STREAM_IDLE_TIMEOUT_S", 1.0):
+            gen = stream_llm_response(
+                history, session_id="test", use_rag=False, client=mock_client
+            )
+            # Fetch first token
+            first = await anext(gen)
+            tokens.append(first)
+            # Consumer processes slowly, taking longer than LLM_TIMEOUT_S (0.1s > 0.05s)
+            await asyncio.sleep(0.1)
+            # Fetch second token — must succeed without timeout cancellation
+            second = await anext(gen)
+            tokens.append(second)
+            await gen.aclose()
+
+        assert tokens == ["First", "Second"]
+
+    @pytest.mark.asyncio
+    async def test_generator_aclose_closes_stream(self):
+        """aclose() on the generator must close the underlying active stream."""
+        mock_client = MagicMock()
+        mock_stream = MockAsyncStream(
+            [
+                make_chunk(content="Token 1"),
+                make_chunk(content="Token 2"),
+            ]
+        )
+        mock_stream.aclose = AsyncMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=mock_stream)
+
+        history = [{"role": "user", "content": "Hello"}]
+        gen = stream_llm_response(
+            history, session_id="test", use_rag=False, client=mock_client
+        )
+        token = await anext(gen)
+        assert token == "Token 1"
+        assert not mock_stream.aclose.called
+
+        # Closing generator while active stream is open
+        await gen.aclose()
+        assert mock_stream.aclose.called
+
+    @pytest.mark.asyncio
+    async def test_fallback_closes_primary_stream_first(self):
+        """When primary model fails/produces 0 tokens, primary stream is closed before fallback starts."""
+        mock_client = MagicMock()
+        event_log = []
+
+        primary_stream = MockAsyncStream([make_chunk(content=None, reasoning="Thinking only...")])
+
+        async def primary_close():
+            event_log.append("primary_closed")
+            primary_stream.is_closed = True
+
+        primary_stream.aclose = primary_close
+
+        fallback_stream = MockAsyncStream([make_chunk(content="Fallback answer")])
+
+        async def mock_create(**kwargs):
+            if kwargs.get("model") == LLM_MODEL:
+                return primary_stream
+            event_log.append("fallback_created")
+            return fallback_stream
+
+        mock_client.chat.completions.create = AsyncMock(side_effect=mock_create)
+
+        history = [{"role": "user", "content": "Hello"}]
+        tokens = [
+            t
+            async for t in stream_llm_response(
+                history, session_id="test", use_rag=False, client=mock_client
+            )
+        ]
+
+        assert tokens == ["Fallback answer"]
+        assert event_log == ["primary_closed", "fallback_created"]
+        assert primary_stream.is_closed is True
+
+
+class TestLazyClientCreation:
+    def test_importing_llm_and_stt_does_not_construct_asyncgroq(self):
+        """Importing llm and stt must not construct AsyncGroq at import time."""
+        with patch("groq.AsyncGroq", side_effect=RuntimeError("Must not construct AsyncGroq at import time")):
+            import llm
+            import stt
+            importlib.reload(llm)
+            importlib.reload(stt)
+
+    def test_llm_client_created_with_max_retries_zero(self):
+        """When get_default_client is called, max_retries=0 is passed if supported."""
+        import llm
+        with patch("llm.AsyncGroq") as mock_groq, patch("llm._default_client", None):
+            llm.get_default_client()
+            mock_groq.assert_called_once_with(max_retries=0)
+
+    def test_llm_client_fallback_if_max_retries_unsupported(self):
+        """If AsyncGroq raises TypeError on max_retries, it logs a warning and falls back to AsyncGroq()."""
+        import llm
+
+        def mock_groq_init(**kwargs):
+            if "max_retries" in kwargs:
+                raise TypeError("unexpected keyword argument 'max_retries'")
+            return MagicMock()
+
+        with patch("llm.AsyncGroq", side_effect=mock_groq_init), patch("llm._default_client", None):
+            client = llm.get_default_client()
+            assert client is not None
+
+    def test_stt_client_lazy_instantiation_with_max_retries(self):
+        """When stt.get_client is called, max_retries=0 is passed if supported."""
+        import stt
+        with patch("stt.AsyncGroq") as mock_groq, patch("stt._client", None):
+            stt.get_client()
+            mock_groq.assert_called_once_with(max_retries=0)
 
 
 class TestGPTOSSModelHelper:

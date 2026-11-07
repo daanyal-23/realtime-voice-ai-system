@@ -43,12 +43,36 @@ def get_default_client() -> AsyncGroq:
     """Lazily initialize and return default AsyncGroq client."""
     global _default_client
     if _default_client is None:
-        _default_client = AsyncGroq()
+        try:
+            _default_client = AsyncGroq(max_retries=0)
+        except TypeError:
+            logger.warning("Groq SDK does not support max_retries parameter")
+            _default_client = AsyncGroq()
     return _default_client
 
 
-# Preserved for backwards compatibility with any existing imports
-client = get_default_client()
+def __getattr__(name: str):
+    """Provide lazy access to module-level client without instantiating at import time."""
+    if name == "client":
+        return get_default_client()
+    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
+
+
+async def _close_stream(stream: Optional[object]) -> None:
+    """Close an async stream safely, supporting both aclose and close (sync or async)."""
+    if stream is None:
+        return
+    try:
+        if hasattr(stream, "aclose") and callable(stream.aclose):
+            res = stream.aclose()
+            if asyncio.iscoroutine(res):
+                await res
+        elif hasattr(stream, "close") and callable(stream.close):
+            res = stream.close()
+            if asyncio.iscoroutine(res):
+                await res
+    except Exception as e:
+        logger.warning(f"Error closing stream: {e}")
 
 SYSTEM_PROMPT = """You are a helpful, conversational AI voice assistant.
 Keep your responses concise and natural for spoken conversation.
@@ -123,6 +147,8 @@ async def stream_llm_response(
         t_start = time.perf_counter()
         token_count = 0
         first_token_received = False
+        first_chunk_content = None
+        stream = None
         stream_iter = None
 
         create_kwargs = {
@@ -136,16 +162,80 @@ async def stream_llm_response(
         if _is_gpt_oss_model(model):
             create_kwargs["reasoning_effort"] = LLM_REASONING_EFFORT
 
-        # Phase 1: Bounded by LLM_TIMEOUT_S (Time-to-first-content-token)
         try:
-            async with asyncio.timeout(LLM_TIMEOUT_S):
-                stream = await active_client.chat.completions.create(**create_kwargs)
-                stream_iter = stream.__aiter__()
-                while not first_token_received:
+            # Phase 1: Bounded by LLM_TIMEOUT_S (Time-to-first-content-token)
+            # No yield inside the timeout block: fetch chunk inside, exit block, then yield
+            try:
+                async with asyncio.timeout(LLM_TIMEOUT_S):
+                    stream = await active_client.chat.completions.create(**create_kwargs)
+                    stream_iter = stream.__aiter__()
+                    while not first_token_received:
+                        try:
+                            chunk = await anext(stream_iter)
+                        except StopAsyncIteration:
+                            break
+
+                        if not chunk.choices:
+                            continue
+
+                        delta = chunk.choices[0].delta
+                        content = getattr(delta, "content", None)
+                        if content:
+                            first_chunk_content = content
+                            first_token_received = True
+                            latency_ms = (time.perf_counter() - t_start) * 1000
+                            logger.info(
+                                f"[{session_id}] Isolated first-content-token latency for {model}: {latency_ms:.1f}ms"
+                            )
+                            token_count += 1
+                            break
+
+            except TimeoutError:
+                logger.warning(
+                    f"[{session_id}] Model {model} timed out waiting for first content token after {LLM_TIMEOUT_S}s"
+                )
+                # 0 tokens yielded -> continue to fallback (finally closes stream first)
+                continue
+            except (Exception, asyncio.CancelledError) as e:
+                if isinstance(e, asyncio.CancelledError):
+                    raise
+                logger.warning(
+                    f"[{session_id}] Model {model} failed before first content token: {type(e).__name__}: {e}"
+                )
+                # 0 tokens yielded -> continue to fallback (finally closes stream first)
+                continue
+
+            # If stream closed without yielding any content (e.g. empty or reasoning only)
+            if not first_token_received:
+                logger.warning(f"[{session_id}] Model {model} produced 0 content tokens")
+                # 0 tokens yielded -> continue to fallback (finally closes stream first)
+                continue
+
+            # Yield the first token OUTSIDE the asyncio.timeout block
+            yield first_chunk_content
+
+            # Phase 2: Stream remaining chunks bounded by LLM_STREAM_IDLE_TIMEOUT_S between chunks
+            # Once content was already yielded, never start fallback (to prevent duplicate answer)
+            if stream_iter is not None:
+                while True:
                     try:
-                        chunk = await anext(stream_iter)
+                        async with asyncio.timeout(LLM_STREAM_IDLE_TIMEOUT_S):
+                            chunk = await anext(stream_iter)
                     except StopAsyncIteration:
-                        break
+                        # Stream completed normally
+                        return
+                    except TimeoutError:
+                        logger.warning(
+                            f"[{session_id}] Model {model} stream idle timeout after {LLM_STREAM_IDLE_TIMEOUT_S}s between chunks. Ending stream without fallback."
+                        )
+                        return
+                    except (Exception, asyncio.CancelledError) as e:
+                        if isinstance(e, asyncio.CancelledError):
+                            raise
+                        logger.warning(
+                            f"[{session_id}] Model {model} failed mid-stream after yielding {token_count} tokens: {type(e).__name__}: {e}. Ending stream without fallback."
+                        )
+                        return
 
                     if not chunk.choices:
                         continue
@@ -153,68 +243,13 @@ async def stream_llm_response(
                     delta = chunk.choices[0].delta
                     content = getattr(delta, "content", None)
                     if content:
-                        first_token_received = True
-                        latency_ms = (time.perf_counter() - t_start) * 1000
-                        logger.info(
-                            f"[{session_id}] Isolated first-content-token latency for {model}: {latency_ms:.1f}ms"
-                        )
                         token_count += 1
                         yield content
 
-        except TimeoutError:
-            logger.warning(
-                f"[{session_id}] Model {model} timed out waiting for first content token after {LLM_TIMEOUT_S}s"
-            )
-            # 0 tokens yielded -> continue to fallback
-            continue
-        except (Exception, asyncio.CancelledError) as e:
-            if isinstance(e, asyncio.CancelledError):
-                raise
-            logger.warning(
-                f"[{session_id}] Model {model} failed before first content token: {type(e).__name__}: {e}"
-            )
-            # 0 tokens yielded -> continue to fallback
-            continue
+                return
 
-        # If stream closed without yielding any content (e.g. empty or reasoning only)
-        if not first_token_received:
-            logger.warning(f"[{session_id}] Model {model} produced 0 content tokens")
-            # 0 tokens yielded -> continue to fallback
-            continue
-
-        # Phase 2: Stream remaining chunks bounded by LLM_STREAM_IDLE_TIMEOUT_S between chunks
-        # Once content was already yielded, never start fallback (to prevent duplicate answer)
-        if stream_iter is not None:
-            while True:
-                try:
-                    async with asyncio.timeout(LLM_STREAM_IDLE_TIMEOUT_S):
-                        chunk = await anext(stream_iter)
-                except StopAsyncIteration:
-                    # Stream completed normally
-                    return
-                except TimeoutError:
-                    logger.warning(
-                        f"[{session_id}] Model {model} stream idle timeout after {LLM_STREAM_IDLE_TIMEOUT_S}s between chunks. Ending stream without fallback."
-                    )
-                    return
-                except (Exception, asyncio.CancelledError) as e:
-                    if isinstance(e, asyncio.CancelledError):
-                        raise
-                    logger.warning(
-                        f"[{session_id}] Model {model} failed mid-stream after yielding {token_count} tokens: {type(e).__name__}: {e}. Ending stream without fallback."
-                    )
-                    return
-
-                if not chunk.choices:
-                    continue
-
-                delta = chunk.choices[0].delta
-                content = getattr(delta, "content", None)
-                if content:
-                    token_count += 1
-                    yield content
-
-            return
+        finally:
+            await _close_stream(stream)
 
     # If both primary and fallback models produced no content
     logger.error(
