@@ -1,0 +1,2 @@
+What This Assistant Can and Cannot Do
+This automated voice assistant provides general information about practice hours, services, and policies. It cannot access personal medical records, make clinical assessments, give diagnostic advice, book or cancel appointments directly, or transfer telephone calls to practice staff.

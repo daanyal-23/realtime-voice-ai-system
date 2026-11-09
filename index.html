@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Voice AI — SniperThink</title>
+  <title>Real-Time Voice Agent Demo</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:ital,wght@0,300;0,500;1,300&display=swap" rel="stylesheet" />
   <style>
@@ -194,6 +194,32 @@
     .stat-val.warn { color: #f7c26a; }
     .stat-val.bad  { color: var(--red); }
 
+    .headline-stat {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin-bottom: 12px;
+      text-align: center;
+    }
+    .headline-label {
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      margin-bottom: 4px;
+    }
+    .headline-val {
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 20px;
+      font-weight: 600;
+    }
+    .headline-val.good { color: var(--green); }
+    .headline-val.warn { color: #f7c26a; }
+    .headline-val.bad  { color: var(--red); }
+
     .controls {
       padding: 20px;
       display: flex;
@@ -284,7 +310,7 @@
 <body>
 
 <header>
-  <div class="logo">VoiceAI // SniperThink</div>
+  <div class="logo">VoiceAI // Real-Time Voice Agent</div>
   <div class="status-pill">
     <div class="status-dot" id="statusDot"></div>
     <span id="statusText">DISCONNECTED</span>
@@ -314,18 +340,26 @@
     </div>
 
     <div class="stats-section">
-      <div class="panel-label" style="padding:0 0 10px; border:none">// latency</div>
+      <div class="panel-label" style="padding:0 0 10px; border:none">// latency metrics</div>
+      <div class="headline-stat">
+        <div class="headline-label">Time to First Audio</div>
+        <div class="headline-val" id="stat-first-audio">—</div>
+      </div>
       <div class="stat-row">
         <span class="stat-key">STT</span>
         <span class="stat-val" id="stat-stt">—</span>
       </div>
       <div class="stat-row">
-        <span class="stat-key">LLM First Token</span>
-        <span class="stat-val" id="stat-llm">—</span>
+        <span class="stat-key">RAG</span>
+        <span class="stat-val" id="stat-rag">—</span>
       </div>
       <div class="stat-row">
-        <span class="stat-key">End-to-End</span>
-        <span class="stat-val" id="stat-e2e">—</span>
+        <span class="stat-key">LLM TTFT</span>
+        <span class="stat-val" id="stat-llm-ttft">—</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-key">Total Turn</span>
+        <span class="stat-val" id="stat-total-turn">—</span>
       </div>
       <div class="stat-row">
         <span class="stat-key">Messages</span>
@@ -381,11 +415,17 @@ let isMicActive    = false;
 let isAISpeaking   = false;
 let messageCount   = 0;
 
-// UI message state
-let currentAiMsgEl = null;
-let currentAiText  = "";
-let turnStartTime  = null;
-let lastInterrupt = 0;
+// UI message state and turn tracking
+let currentAiMsgEl  = null;
+let currentAiText   = "";
+let currentAiTurnId = null;
+let turnStartTime   = null;
+let lastInterrupt   = 0;
+const supersededTurnIds = new Set();
+
+// Barge-in configuration
+const BARGE_IN_RMS = 0.04;
+let consecutiveBargeInChunks = 0;
 
 // Web Audio API playback 
 // Using Web Audio API instead of <audio> element because
@@ -478,6 +518,13 @@ function playNext() {
 }
 
 // WebSocket 
+window.addEventListener("DOMContentLoaded", () => {
+  const wsInput = document.getElementById("wsUrl");
+  if (wsInput && location.hostname && location.hostname !== "localhost") {
+    wsInput.value = `ws://${location.hostname}:8765`;
+  }
+});
+
 function toggleConnection() {
   isConnected ? disconnect() : connect();
 }
@@ -531,6 +578,12 @@ function disconnect() {
 
 // Control messages 
 function handleControlMessage(msg) {
+  // Ignore any late messages belonging to a superseded turn
+  const turnId = msg.turn_id;
+  if (turnId != null && supersededTurnIds.has(turnId)) {
+    return;
+  }
+
   switch (msg.type) {
 
     case "status":
@@ -540,9 +593,12 @@ function handleControlMessage(msg) {
 
     case "transcript":
       finishAiMessage();
-      appendMessage("user", msg.text);
+      appendMessage("user", msg.text, msg.turn_id);
       setStatus("listening", "PROCESSING");
-      updateStat("stat-stt", msg.latency_ms, 500, 1000);
+      const sttMs = msg.stt_ms != null ? msg.stt_ms : msg.latency_ms;
+      if (sttMs != null) {
+        updateStat("stat-stt", sttMs, 500, 1000);
+      }
       turnStartTime = performance.now();
       break;
 
@@ -550,36 +606,80 @@ function handleControlMessage(msg) {
       isAISpeaking  = true;
       audioStopped  = false;   // ready to receive new audio
       setStatus("speaking", "AI SPEAKING");
-      currentAiText  = "";
-      currentAiMsgEl = appendMessage("ai", "");
+      if (!currentAiMsgEl) {
+        currentAiText   = "";
+        currentAiTurnId = msg.turn_id;
+        currentAiMsgEl  = appendMessage("ai", "", msg.turn_id);
+      }
+      if (msg.speech_end_to_first_audio_ms != null) {
+        updateStat("stat-first-audio", msg.speech_end_to_first_audio_ms, 1500, 2500);
+      }
       break;
 
     case "ai_text":
-      if (currentAiMsgEl) {
-        currentAiText += msg.token;
-        updateStreamingMessage(currentAiMsgEl, currentAiText);
+      if (!currentAiMsgEl) {
+        currentAiText   = "";
+        currentAiTurnId = msg.turn_id;
+        currentAiMsgEl  = appendMessage("ai", "", msg.turn_id);
       }
+      currentAiText += (msg.token || "");
+      updateStreamingMessage(currentAiMsgEl, currentAiText);
       break;
 
     case "turn_end":
       isAISpeaking = false;
       finishAiMessage();
+      currentAiTurnId = null;
       setStatus("connected", "LISTENING");
-      if (turnStartTime && msg.total_latency_ms)
-        updateStat("stat-e2e", msg.total_latency_ms, 1500, 3000);
+      if (msg.speech_end_to_first_audio_ms != null && msg.speech_end_to_first_audio_ms > 0) {
+        updateStat("stat-first-audio", msg.speech_end_to_first_audio_ms, 1500, 2500);
+      }
+      if (msg.stt_ms != null) {
+        updateStat("stat-stt", msg.stt_ms, 500, 1000);
+      }
+      if (msg.rag_ms != null) {
+        updateStat("stat-rag", msg.rag_ms, 50, 150);
+      }
+      if (msg.llm_ttft_ms != null && msg.llm_ttft_ms > 0) {
+        updateStat("stat-llm-ttft", msg.llm_ttft_ms, 600, 1200);
+      }
+      const totalTurnMs = msg.total_turn_ms != null ? msg.total_turn_ms : msg.total_latency_ms;
+      if (totalTurnMs != null && totalTurnMs > 0) {
+        updateStat("stat-total-turn", totalTurnMs, 2500, 5000);
+      }
       document.getElementById("stat-msgs").textContent = ++messageCount;
+      break;
+
+    case "turn_superseded":
+      const supTurnId = msg.turn_id;
+      if (supTurnId != null) {
+        supersededTurnIds.add(supTurnId);
+        // Remove all message bubbles associated with this superseded turn
+        const bubbles = document.querySelectorAll(`[data-turn-id="${supTurnId}"]`);
+        bubbles.forEach(b => b.remove());
+        if (currentAiTurnId === supTurnId) {
+          if (currentAiMsgEl) {
+            currentAiMsgEl.remove();
+            currentAiMsgEl = null;
+          }
+          currentAiText = "";
+          currentAiTurnId = null;
+        }
+      }
       break;
 
     case "interrupted":
       isAISpeaking = false;
       stopAudioNow();
       finishAiMessage();
+      currentAiTurnId = null;
       setStatus("listening", "INTERRUPTED");
       break;
 
     case "latency":
-      if (msg.llm_first_token_ms)
-        updateStat("stat-llm", msg.llm_first_token_ms, 600, 1200);
+      if (msg.stt_ms != null) updateStat("stat-stt", msg.stt_ms, 500, 1000);
+      if (msg.rag_ms != null) updateStat("stat-rag", msg.rag_ms, 50, 150);
+      if (msg.llm_ttft_ms != null) updateStat("stat-llm-ttft", msg.llm_ttft_ms, 600, 1200);
       break;
 
     case "error":
@@ -617,22 +717,30 @@ async function startMic() {
 
       const float32 = event.inputBuffer.getChannelData(0);
 
-      // Interruption detection , runs every ~256ms
+      // Barge-in interruption detection (applied only while assistant is speaking or playing audio)
       if (isAISpeaking || isPlaying) {
         const rms = Math.sqrt(
           float32.reduce((s, v) => s + v * v, 0) / float32.length
         );
-        if (rms > 0.015) {
-          const now = Date.now();
-          if (now - lastInterrupt > 500) {   // prevent interrupt spam
-            lastInterrupt = now;
-            stopAudioNow();
-            isAISpeaking = false;
-            setStatus("listening", "INTERRUPTED");
-            finishAiMessage();
-            ws.send(JSON.stringify({ type: "interrupt" }));
+        if (rms >= BARGE_IN_RMS) {
+          consecutiveBargeInChunks++;
+          if (consecutiveBargeInChunks >= 2) {
+            consecutiveBargeInChunks = 0;
+            const now = Date.now();
+            if (now - lastInterrupt > 500) {   // prevent interrupt spam
+              lastInterrupt = now;
+              stopAudioNow();
+              isAISpeaking = false;
+              setStatus("listening", "INTERRUPTED");
+              finishAiMessage();
+              ws.send(JSON.stringify({ type: "interrupt" }));
+            }
           }
+        } else {
+          consecutiveBargeInChunks = 0;
         }
+      } else {
+        consecutiveBargeInChunks = 0;
       }
 
       // Convert float32 PCM → int16 and send to backend
@@ -702,13 +810,16 @@ function setStatus(state, text) {
   document.getElementById("statusText").textContent = text;
 }
 
-function appendMessage(role, text) {
+function appendMessage(role, text, turnId) {
   const empty = document.getElementById("emptyState");
   if (empty) empty.remove();
 
   const messages = document.getElementById("messages");
   const div = document.createElement("div");
   div.className = `message ${role}`;
+  if (turnId != null) {
+    div.dataset.turnId = String(turnId);
+  }
   div.innerHTML = `
     <div class="message-role">${role === "user" ? "// you" : "// ai"}</div>
     <div class="message-text">${escapeHtml(text)}${role === "ai" ? '<span class="cursor"></span>' : ""}</div>
@@ -728,8 +839,9 @@ function finishAiMessage() {
   if (currentAiMsgEl) {
     const textEl = currentAiMsgEl.querySelector(".message-text");
     if (textEl) textEl.innerHTML = escapeHtml(currentAiText);
-    currentAiMsgEl = null;
-    currentAiText  = "";
+    currentAiMsgEl  = null;
+    currentAiText   = "";
+    currentAiTurnId = null;
   }
 }
 
@@ -747,10 +859,14 @@ function updateStat(id, ms, warnMs, badMs) {
   if (!el || ms == null) return;
   const val = Math.round(ms);
   el.textContent = `${val}ms`;
-  el.className = "stat-val " + (val < warnMs ? "good" : val < badMs ? "warn" : "bad");
+  const baseClass = id === "stat-first-audio" ? "headline-val " : "stat-val ";
+  el.className = baseClass + (val < warnMs ? "good" : val < badMs ? "warn" : "bad");
 }
 
 function resetConversation() {
+  finishAiMessage();
+  supersededTurnIds.clear();
+  consecutiveBargeInChunks = 0;
   if (ws && ws.readyState === WebSocket.OPEN)
     ws.send(JSON.stringify({ type: "reset" }));
 
@@ -764,6 +880,21 @@ function resetConversation() {
     </div>`;
   messageCount = 0;
   document.getElementById("stat-msgs").textContent = "0";
+
+  const resetMap = {
+    "stat-first-audio": "headline-val",
+    "stat-stt": "stat-val",
+    "stat-rag": "stat-val",
+    "stat-llm-ttft": "stat-val",
+    "stat-total-turn": "stat-val"
+  };
+  for (const [id, cls] of Object.entries(resetMap)) {
+    const el = document.getElementById(id);
+    if (el) {
+      el.textContent = "—";
+      el.className = cls;
+    }
+  }
 }
 
 function escapeHtml(t) {

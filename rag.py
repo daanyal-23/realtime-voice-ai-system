@@ -49,6 +49,19 @@ def _get_embedder():
     return _embedder
 
 
+def _expand_query(query: str) -> str:
+    """
+    Apply targeted query expansion for domain-specific inquiries where brief
+    user queries have high semantic mismatch with knowledge base document phrasing.
+    Preserves exact original query for unrelated and non-weekend inquiries.
+    """
+    ql = query.lower()
+    if any(w in ql for w in ["saturday", "weekend", "weekends", "sunday"]):
+        if any(w in ql for w in ["hour", "hours", "open", "opening", "time", "times", "closed", "closing", "come in", "appointment", "appointments"]):
+            return f"{query} (practice surgery opening hours schedule and weekend closures)"
+    return query
+
+
 class VectorStore:
     """Simple in-memory vector store with cosine similarity search."""
 
@@ -94,6 +107,8 @@ class VectorStore:
         """Search for most relevant chunks. Returns (chunk, score, source) list."""
         if not self._initialized or self.embeddings is None:
             return []
+
+        query = _expand_query(query)
 
         loop = asyncio.get_event_loop()
         embedder = _get_embedder()

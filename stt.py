@@ -9,12 +9,16 @@ Optimizations for low latency:
 
 import io
 import logging
+import re
 import wave
 
 from typing import Optional
 
+from dotenv import load_dotenv
 import numpy as np
 from groq import AsyncGroq
+
+load_dotenv()
 
 logger = logging.getLogger("stt")
 
@@ -96,10 +100,75 @@ def _pcm_to_wav(pcm_data: bytes, sample_rate: int = SAMPLE_RATE) -> bytes:
     return buf.getvalue()
 
 
-async def transcribe_audio(pcm_data: bytes, session_id: str = "") -> str:
+WHISPER_PROMPT = (
+    "Oak Lane Medical Practice GP receptionist demo. "
+    "Repeat prescription, working days, appointments, NHS 111."
+)
+
+_KNOWN_NON_SPEECH_CAPTIONS = {
+    "music",
+    "music playing",
+    "playing music",
+    "background music",
+    "applause",
+    "laughter",
+    "laughing",
+    "chuckle",
+    "chuckles",
+    "giggle",
+    "giggles",
+    "cheering",
+    "cheers",
+    "sigh",
+    "sighs",
+    "gasp",
+    "gasps",
+    "cough",
+    "coughing",
+    "coughs",
+    "throat clearing",
+    "silence",
+    "blank audio",
+}
+
+
+def is_non_speech_caption(text: str) -> bool:
+    """
+    Check if a transcript matches a known Whisper non-speech/ambient caption.
+    Returns True only for recognized standalone non-speech captions.
+    Preserves legitimate sentences containing these words.
+    """
+    cleaned = text.strip()
+    if not cleaned:
+        return False
+
+    # Strip any trailing punctuation before bracket removal (e.g. "[cheering]!")
+    cleaned = re.sub(r"[.,!?;:]+$", "", cleaned).strip()
+
+    # Strip surrounding brackets or parentheses: [Music] -> Music, (music) -> music
+    if (cleaned.startswith("[") and cleaned.endswith("]")) or (
+        cleaned.startswith("(") and cleaned.endswith(")")
+    ):
+        inner = cleaned[1:-1].strip()
+    else:
+        inner = cleaned
+
+    # Strip trailing punctuation inside brackets if any (e.g. "[Music.]") and normalize whitespace
+    normalized = re.sub(r"[.,!?;:]+$", "", inner).strip().lower()
+    normalized = " ".join(normalized.split())
+
+    return normalized in _KNOWN_NON_SPEECH_CAPTIONS
+
+
+async def transcribe_audio(
+    pcm_data: bytes,
+    session_id: str = "",
+    prompt: Optional[str] = None,
+) -> str:
     """
     Transcribe PCM audio bytes to text using Groq Whisper.
     Strips silence first to minimize audio duration sent to API.
+    Filters known standalone non-speech Whisper captions to empty strings.
     """
     # Strip silence to reduce audio size → faster Whisper response
     trimmed_pcm = _strip_silence(pcm_data)
@@ -108,6 +177,8 @@ async def transcribe_audio(pcm_data: bytes, session_id: str = "") -> str:
     audio_file = io.BytesIO(wav_data)
     audio_file.name = "audio.wav"
 
+    whisper_prompt = prompt if prompt is not None else WHISPER_PROMPT
+
     try:
         active_client = get_client()
         response = await active_client.audio.transcriptions.create(
@@ -115,8 +186,12 @@ async def transcribe_audio(pcm_data: bytes, session_id: str = "") -> str:
             file=audio_file,
             response_format="text",
             language="en",
+            prompt=whisper_prompt,
         )
         transcript = response.strip() if isinstance(response, str) else response.text.strip()
+        if is_non_speech_caption(transcript):
+            logger.info(f"[{session_id}] Filtered non-speech Whisper caption: '{transcript}' -> ''")
+            return ""
         logger.debug(f"[{session_id}] Transcript: '{transcript[:80]}'")
         return transcript
     except Exception as e:

@@ -5,6 +5,7 @@ Verifies all acceptance criteria and corrections for Task A2.
 
 import asyncio
 import json
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -553,6 +554,550 @@ class TestPipelineLifecycle:
             assert "Hello there." in tts_inputs
             assert "How are you doing?" in tts_inputs
             assert not any("  " in s or "\n" in s or "\t" in s for s in tts_inputs)
+
+    @pytest.mark.asyncio
+    async def test_120ms_click_during_processing_does_not_cancel_or_duplicate(self):
+        """A 120ms noise click during PROCESSING does not cancel the in-flight turn or produce duplicate transcripts."""
+        import numpy as np
+        ws = MockWebSocket()
+        pipeline = VoicePipeline(session_id="test_click", websocket=ws)
+
+        llm_gate = asyncio.Event()
+
+        async def mock_transcribe(audio_data, session_id=""):
+            return "Turn 1 question"
+
+        async def mock_stream_llm(history, session_id=""):
+            await llm_gate.wait()
+            yield "Turn 1 answer."
+
+        async def mock_tts(sentence, session_id=""):
+            yield b"AUDIO"
+
+        with patch("pipeline.transcribe_audio", side_effect=mock_transcribe), \
+             patch("pipeline.stream_llm_response", side_effect=mock_stream_llm), \
+             patch("pipeline.stream_tts_audio", side_effect=mock_tts):
+
+            # Start Turn 1
+            audio_1 = b"\x01\x00" * 4800  # 300ms
+            task_1 = await pipeline._start_turn(audio_1)
+
+            # Let Turn 1 complete STT and reach the LLM gate
+            while len([m for m in ws.sent_messages if m.get("type") == "transcript"]) == 0:
+                await asyncio.sleep(0.01)
+
+            assert pipeline.state == STATE_PROCESSING
+            assert not task_1.done()
+
+            # Generate 6 frames of 20ms click audio (120ms total)
+            click_frame = (np.sin(np.linspace(0, 1, 320)) * 3276).astype(np.int16).tobytes()
+            silence_frame = (np.zeros(320, dtype=np.int16)).tobytes()
+
+            # Feed 6 frames of click (120ms)
+            for _ in range(6):
+                await pipeline._handle_audio_chunk(click_frame)
+
+            # Feed 15 frames of silence to end the click segment
+            for _ in range(15):
+                await pipeline._handle_audio_chunk(silence_frame)
+
+            # Assert Turn 1 was NOT cancelled!
+            assert not task_1.done()
+            assert not task_1.cancelled()
+            assert pipeline.state == STATE_PROCESSING
+
+            # Release the LLM gate and let Turn 1 finish
+            llm_gate.set()
+            await task_1
+
+            # Turn 1 must have produced exactly 1 transcript message and 1 turn_end
+            transcripts = [m for m in ws.sent_messages if m.get("type") == "transcript"]
+            assert len(transcripts) == 1
+            assert transcripts[0]["text"] == "Turn 1 question"
+            assert transcripts[0]["turn_id"] == 1
+
+    @pytest.mark.asyncio
+    async def test_1_2s_genuine_continuation_during_processing_supersedes_and_processes_once(self):
+        """A 1.2-second genuine continuation during PROCESSING supersedes the old turn and is processed exactly once."""
+        import numpy as np
+        ws = MockWebSocket()
+        pipeline = VoicePipeline(session_id="test_continuation", websocket=ws)
+
+        stt_calls = []
+        llm_gate = asyncio.Event()
+
+        async def mock_transcribe(audio_data, session_id=""):
+            stt_calls.append(audio_data)
+            return f"Transcribed_{len(stt_calls)}"
+
+        async def mock_stream_llm(history, session_id=""):
+            if len(stt_calls) == 1:
+                # Turn 1: hold in processing
+                await llm_gate.wait()
+            yield "Answer."
+
+        async def mock_tts(sentence, session_id=""):
+            yield b"AUDIO"
+
+        with patch("pipeline.transcribe_audio", side_effect=mock_transcribe), \
+             patch("pipeline.stream_llm_response", side_effect=mock_stream_llm), \
+             patch("pipeline.stream_tts_audio", side_effect=mock_tts):
+
+            # Start Turn 1
+            audio_1 = b"\x01\x00" * 4800  # 300ms
+            task_1 = await pipeline._start_turn(audio_1)
+
+            # Wait until Turn 1 emits transcript and holds in LLM
+            while len([m for m in ws.sent_messages if m.get("type") == "transcript"]) == 0:
+                await asyncio.sleep(0.01)
+
+            assert pipeline.state == STATE_PROCESSING
+            assert not task_1.done()
+
+            # Feed 1.2s of genuine speech (60 frames of 20ms)
+            speech_frame = (np.sin(np.linspace(0, 1, 320)) * 3276).astype(np.int16).tobytes()
+            silence_frame = (np.zeros(320, dtype=np.int16)).tobytes()
+
+            for _ in range(60):
+                await pipeline._handle_audio_chunk(speech_frame)
+
+            # Turn 1 must now be cancelled/done and superseded event sent
+            assert task_1.done() or task_1.cancelled()
+            superseded_msgs = [m for m in ws.sent_messages if m.get("type") == "turn_superseded"]
+            assert len(superseded_msgs) == 1
+            assert superseded_msgs[0]["turn_id"] == 1
+
+            # End speech with 15 frames of silence
+            for _ in range(15):
+                await pipeline._handle_audio_chunk(silence_frame)
+
+            # Turn 2 should start and complete
+            if pipeline._current_turn_task:
+                await pipeline._current_turn_task
+
+            assert pipeline.turn_id == 2
+            # Check transcripts: Turn 1 transcript was emitted earlier, then superseded, then Turn 2 transcript
+            transcripts = [m for m in ws.sent_messages if m.get("type") == "transcript"]
+            assert len(transcripts) == 2
+            assert transcripts[0]["turn_id"] == 1
+            assert transcripts[1]["turn_id"] == 2
+
+    @pytest.mark.asyncio
+    async def test_pure_noise_does_not_start_turn(self):
+        """Pure noise or sub-threshold audio does not start an STT/LLM turn."""
+        import numpy as np
+        ws = MockWebSocket()
+        pipeline = VoicePipeline(session_id="test_noise", websocket=ws)
+
+        stt_called = False
+
+        async def mock_transcribe(audio_data, session_id=""):
+            nonlocal stt_called
+            stt_called = True
+            return "Noise"
+
+        with patch("pipeline.transcribe_audio", side_effect=mock_transcribe):
+            # Low amplitude noise (RMS ~0.005, below threshold 0.02)
+            noise_frame = (np.full(320, 150, dtype=np.int16)).tobytes()
+            for _ in range(50):
+                await pipeline._handle_audio_chunk(noise_frame)
+
+            assert pipeline.turn_id == 0
+            assert pipeline.state == STATE_IDLE
+            assert stt_called is False
+            assert len(ws.sent_messages) == 0
+
+    @pytest.mark.asyncio
+    async def test_segments_ending_between_300ms_and_400ms_are_processed(self):
+        """Utterances ending between 300ms and 400ms are legitimate speech and are dispatched to STT."""
+        import numpy as np
+        ws = MockWebSocket()
+        pipeline = VoicePipeline(session_id="test_short_utterance", websocket=ws)
+
+        stt_dispatched = []
+
+        async def mock_transcribe(audio_data, session_id=""):
+            stt_dispatched.append(audio_data)
+            return "No."
+
+        async def mock_stream_llm(history, session_id=""):
+            yield "Understood."
+
+        async def mock_tts(sentence, session_id=""):
+            yield b"AUDIO"
+
+        with patch("pipeline.transcribe_audio", side_effect=mock_transcribe), \
+             patch("pipeline.stream_llm_response", side_effect=mock_stream_llm), \
+             patch("pipeline.stream_tts_audio", side_effect=mock_tts):
+
+            # Speech: 10 frames = 200ms
+            speech_frame = (np.sin(np.linspace(0, 1, 320)) * 3276).astype(np.int16).tobytes()
+            silence_frame = (np.zeros(320, dtype=np.int16)).tobytes()
+
+            for _ in range(10):
+                await pipeline._handle_audio_chunk(speech_frame)
+
+            # Silence: 15 frames = 300ms hangover
+            for _ in range(15):
+                await pipeline._handle_audio_chunk(silence_frame)
+
+            if pipeline._current_turn_task:
+                await pipeline._current_turn_task
+
+            # Turn 1 must have run and processed this short utterance
+            assert len(stt_dispatched) == 1
+            assert pipeline.turn_id == 1
+            # Total audio duration >= 300ms
+            assert len(stt_dispatched[0]) >= 9600
+
+    @pytest.mark.asyncio
+    async def test_finger_snap_short_impulse_in_idle_does_not_start_turn(self):
+        """A finger snap or short impulse (<= 100ms active energy) in IDLE is rejected by the 200ms active gate."""
+        import numpy as np
+        ws = MockWebSocket()
+        pipeline = VoicePipeline(session_id="test_snap_reject", websocket=ws)
+
+        stt_dispatched = []
+
+        async def mock_transcribe(audio_data, session_id=""):
+            stt_dispatched.append(audio_data)
+            return "Thank you"  # Simulated Whisper hallucination if called
+
+        with patch("pipeline.transcribe_audio", side_effect=mock_transcribe):
+            # 5 frames of high-amplitude snap impulse (100ms total)
+            snap_frame = (np.sin(np.linspace(0, 5, 320)) * 16000).astype(np.int16).tobytes()
+            silence_frame = (np.zeros(320, dtype=np.int16)).tobytes()
+
+            for _ in range(5):
+                await pipeline._handle_audio_chunk(snap_frame)
+
+            # 15 frames of silence hangover
+            for _ in range(15):
+                await pipeline._handle_audio_chunk(silence_frame)
+
+            if pipeline._current_turn_task:
+                await pipeline._current_turn_task
+
+            # Verify: turn NEVER started and STT was NEVER called!
+            assert len(stt_dispatched) == 0
+            assert pipeline.turn_id == 0
+            assert pipeline.state == STATE_IDLE
+            assert len([m for m in ws.sent_messages if m.get("type") == "transcript"]) == 0
+
+    @pytest.mark.asyncio
+    async def test_loud_non_speech_noise_burst_in_idle_does_not_start_turn(self):
+        """A 120ms loud non-speech noise burst in IDLE is rejected by the 200ms active gate."""
+        import numpy as np
+        ws = MockWebSocket()
+        pipeline = VoicePipeline(session_id="test_loud_burst_reject", websocket=ws)
+
+        stt_called = False
+
+        async def mock_transcribe(audio_data, session_id=""):
+            nonlocal stt_called
+            stt_called = True
+            return "Noise"
+
+        with patch("pipeline.transcribe_audio", side_effect=mock_transcribe):
+            # 6 frames of loud noise (120ms)
+            noise_frame = (np.sin(np.linspace(0, 3, 320)) * 12000).astype(np.int16).tobytes()
+            silence_frame = (np.zeros(320, dtype=np.int16)).tobytes()
+
+            for _ in range(6):
+                await pipeline._handle_audio_chunk(noise_frame)
+
+            for _ in range(15):
+                await pipeline._handle_audio_chunk(silence_frame)
+
+            assert stt_called is False
+            assert pipeline.turn_id == 0
+            assert pipeline.state == STATE_IDLE
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("short_word", ["No", "Yes", "Wait"])
+    async def test_genuine_short_speech_words_start_turn(self, short_word):
+        """Genuine short utterances like 'No', 'Yes', 'Wait' (active duration >= 200ms) start a turn cleanly."""
+        import numpy as np
+        ws = MockWebSocket()
+        pipeline = VoicePipeline(session_id=f"test_short_{short_word.lower()}", websocket=ws)
+
+        stt_dispatched = []
+
+        async def mock_transcribe(audio_data, session_id=""):
+            stt_dispatched.append(audio_data)
+            return f"{short_word}."
+
+        async def mock_stream_llm(history, session_id=""):
+            yield "Understood."
+
+        async def mock_tts(sentence, session_id=""):
+            yield b"AUDIO"
+
+        with patch("pipeline.transcribe_audio", side_effect=mock_transcribe), \
+             patch("pipeline.stream_llm_response", side_effect=mock_stream_llm), \
+             patch("pipeline.stream_tts_audio", side_effect=mock_tts):
+
+            # 13 frames of speech (~260ms active speech, e.g. brisk "No" / "Yes" / "Wait")
+            speech_frame = (np.sin(np.linspace(0, 2, 320)) * 4000).astype(np.int16).tobytes()
+            silence_frame = (np.zeros(320, dtype=np.int16)).tobytes()
+
+            for _ in range(13):
+                await pipeline._handle_audio_chunk(speech_frame)
+
+            for _ in range(15):
+                await pipeline._handle_audio_chunk(silence_frame)
+
+            if pipeline._current_turn_task:
+                await pipeline._current_turn_task
+
+            # Turn 1 must have run and called STT
+            assert len(stt_dispatched) == 1
+            assert pipeline.turn_id == 1
+            transcripts = [m for m in ws.sent_messages if m.get("type") == "transcript"]
+            assert len(transcripts) == 1
+            assert transcripts[0]["text"] == f"{short_word}."
+
+    @pytest.mark.asyncio
+    async def test_normal_length_speech_starts_turn(self):
+        """Normal conversational utterance (~1.2s active speech) starts a turn without issue."""
+        import numpy as np
+        ws = MockWebSocket()
+        pipeline = VoicePipeline(session_id="test_normal_speech", websocket=ws)
+
+        stt_dispatched = []
+
+        async def mock_transcribe(audio_data, session_id=""):
+            stt_dispatched.append(audio_data)
+            return "Good morning, I would like to book an appointment."
+
+        async def mock_stream_llm(history, session_id=""):
+            yield "Certainly, I can help with that."
+
+        async def mock_tts(sentence, session_id=""):
+            yield b"AUDIO"
+
+        with patch("pipeline.transcribe_audio", side_effect=mock_transcribe), \
+             patch("pipeline.stream_llm_response", side_effect=mock_stream_llm), \
+             patch("pipeline.stream_tts_audio", side_effect=mock_tts):
+
+            speech_frame = (np.sin(np.linspace(0, 1, 320)) * 4000).astype(np.int16).tobytes()
+            silence_frame = (np.zeros(320, dtype=np.int16)).tobytes()
+
+            # 60 frames = 1200ms active speech
+            for _ in range(60):
+                await pipeline._handle_audio_chunk(speech_frame)
+
+            for _ in range(15):
+                await pipeline._handle_audio_chunk(silence_frame)
+
+            if pipeline._current_turn_task:
+                await pipeline._current_turn_task
+
+            assert len(stt_dispatched) == 1
+            assert pipeline.turn_id == 1
+            transcripts = [m for m in ws.sent_messages if m.get("type") == "transcript"]
+            assert len(transcripts) == 1
+
+
+class TestPipelinedSentenceSynthesis:
+    """Verifies non-blocking, pipelined sentence synthesis and strict audio ordering."""
+
+    @pytest.mark.asyncio
+    async def test_pipelined_synthesis_multi_sentence_correct_order(self):
+        """Multiple sentences are synthesized and delivered across WebSocket in strict order."""
+        ws = MockWebSocket()
+        pipeline = VoicePipeline(session_id="test_pipeline_order", websocket=ws)
+        pipeline.turn_id = 1
+        pipeline._active_turn_id = 1
+
+        sent_order = []
+
+        async def mock_stream_llm(history, **kwargs):
+            # Stream tokens across 3 sentences
+            tokens = [
+                "Good ", "morning, ", "Oak ", "Lane. ",
+                "How ", "can ", "I ", "help? ",
+                "Please ", "let ", "me ", "know."
+            ]
+            for t in tokens:
+                yield t
+
+        async def mock_tts(sentence, session_id=""):
+            sent_order.append(sentence)
+            # Yield distinct audio for each sentence
+            yield f"AUDIO_{sentence}".encode("utf-8")
+
+        with patch("pipeline.stream_llm_response", side_effect=mock_stream_llm), \
+             patch("pipeline.stream_tts_audio", side_effect=mock_tts):
+
+            await pipeline._stream_and_speak(
+                turn_id=1,
+                t_speech_end=time.perf_counter(),
+                stt_ms=100.0,
+                rag_ms=20.0,
+            )
+
+        # Confirm all 3 sentences were synthesized in exact FIFO order
+        assert len(sent_order) == 3
+        assert sent_order[0] == "Good morning, Oak Lane."
+        assert sent_order[1] == "How can I help?"
+        assert sent_order[2] == "Please let me know."
+
+        # Confirm all 3 audio chunks were transmitted to WebSocket in exact FIFO order
+        audio_chunks = ws.sent_binary
+        assert len(audio_chunks) == 3
+        assert audio_chunks[0] == b"AUDIO_Good morning, Oak Lane."
+        assert audio_chunks[1] == b"AUDIO_How can I help?"
+        assert audio_chunks[2] == b"AUDIO_Please let me know."
+
+        # Verify terminal turn_end message was sent
+        turn_ends = [m for m in ws.sent_messages if m.get("type") == "turn_end"]
+        assert len(turn_ends) == 1
+        assert turn_ends[0]["turn_id"] == 1
+
+    @pytest.mark.asyncio
+    async def test_pipelined_synthesis_llm_not_blocked_by_tts(self):
+        """LLM token generation continues unblocked while TTS synthesizes previous sentence."""
+        ws = MockWebSocket()
+        pipeline = VoicePipeline(session_id="test_llm_unblocked", websocket=ws)
+        pipeline.turn_id = 1
+        pipeline._active_turn_id = 1
+
+        llm_finished_time = None
+        tts_start_times = []
+        tts_end_times = []
+
+        async def slow_tts(sentence, session_id=""):
+            tts_start_times.append(time.perf_counter())
+            await asyncio.sleep(0.15)  # Simulate 150ms synthesis time
+            tts_end_times.append(time.perf_counter())
+            yield f"CHUNK_{sentence}".encode("utf-8")
+
+        async def mock_stream_llm(history, **kwargs):
+            nonlocal llm_finished_time
+            # Generate sentence 1
+            yield "First sentence is here. "
+            # Generate sentence 2 without waiting for TTS
+            yield "Second sentence follows immediately."
+            llm_finished_time = time.perf_counter()
+
+        with patch("pipeline.stream_llm_response", side_effect=mock_stream_llm), \
+             patch("pipeline.stream_tts_audio", side_effect=slow_tts):
+
+            await pipeline._stream_and_speak(
+                turn_id=1,
+                t_speech_end=time.perf_counter(),
+                stt_ms=50.0,
+                rag_ms=10.0,
+            )
+
+        # The LLM finished generating BOTH sentences before sentence 1 finished synthesizing!
+        assert llm_finished_time is not None
+        assert len(tts_end_times) == 2
+        # LLM finished earlier than the completion of the 2nd sentence synthesis
+        assert llm_finished_time < tts_end_times[1]
+
+        # Both chunks delivered in order
+        assert len(ws.sent_binary) == 2
+
+    @pytest.mark.asyncio
+    async def test_pipelined_synthesis_barge_in_cancels_pending_sentences(self):
+        """Barge-in / interrupt during synthesis cancels pending sentences; no extra audio sent."""
+        ws = MockWebSocket()
+        pipeline = VoicePipeline(session_id="test_barge_in_pipeline", websocket=ws)
+        pipeline.turn_id = 1
+        pipeline._active_turn_id = 1
+
+        s1_started = asyncio.Event()
+
+        async def mock_tts(sentence, session_id=""):
+            if "First" in sentence:
+                s1_started.set()
+                await asyncio.sleep(0.05)  # Synthesis/playback in flight when barge-in occurs
+                yield b"AUDIO_1"
+            else:
+                yield b"AUDIO_2_SHOULD_NEVER_SEND"
+
+        async def mock_stream_llm(history, **kwargs):
+            yield "First sentence here. "
+            yield "Second sentence pending."
+
+        with patch("pipeline.stream_llm_response", side_effect=mock_stream_llm), \
+             patch("pipeline.stream_tts_audio", side_effect=mock_tts):
+
+            async def run_turn():
+                await pipeline._stream_and_speak(
+                    turn_id=1,
+                    t_speech_end=time.perf_counter(),
+                )
+
+            turn_task = asyncio.create_task(run_turn())
+            pipeline._current_turn_task = turn_task
+            await s1_started.wait()
+
+            # User barge-in occurs while turn 1 is speaking
+            await pipeline._interrupt_turn()
+
+            await asyncio.gather(turn_task, return_exceptions=True)
+
+        # AUDIO_2 must NOT have been sent
+        sent_audio = ws.sent_binary
+        assert b"AUDIO_2_SHOULD_NEVER_SEND" not in sent_audio
+
+    @pytest.mark.asyncio
+    async def test_pipelined_synthesis_superseded_turn_discards_audio(self):
+        """When Turn 1 is superseded by Turn 2, Turn 1 audio is discarded and cannot leak."""
+        ws = MockWebSocket()
+        pipeline = VoicePipeline(session_id="test_superseded_leak", websocket=ws)
+        pipeline.turn_id = 1
+        pipeline._active_turn_id = 1
+
+        t1_in_flight = asyncio.Event()
+
+        async def slow_tts(sentence, session_id=""):
+            if "Turn 1" in sentence:
+                t1_in_flight.set()
+                await asyncio.sleep(0.2)
+                yield b"TURN1_AUDIO"
+            else:
+                yield b"TURN2_AUDIO"
+
+        turn_count = 0
+
+        async def mock_stream_llm(history, **kwargs):
+            nonlocal turn_count
+            turn_count += 1
+            if turn_count == 1:
+                yield "Turn 1 sentence. "
+            else:
+                yield "Turn 2 sentence."
+
+        with patch("pipeline.stream_llm_response", side_effect=mock_stream_llm), \
+             patch("pipeline.stream_tts_audio", side_effect=slow_tts):
+
+            # Start Turn 1
+            t1_task = asyncio.create_task(pipeline._stream_and_speak(
+                turn_id=1,
+                t_speech_end=time.perf_counter(),
+            ))
+
+            await t1_in_flight.wait()
+
+            # Now Turn 2 supersedes Turn 1
+            pipeline._superseded_turn_ids.add(1)
+            pipeline.turn_id = 2
+            pipeline._active_turn_id = 2
+
+            t2_task = asyncio.create_task(pipeline._stream_and_speak(
+                turn_id=2,
+                t_speech_end=time.perf_counter(),
+            ))
+
+            await asyncio.gather(t1_task, t2_task, return_exceptions=True)
+
+        # Only Turn 2 audio sent, never Turn 1
+        assert b"TURN1_AUDIO" not in ws.sent_binary
+        assert b"TURN2_AUDIO" in ws.sent_binary
 
 
 async def asyncio_generator_empty():

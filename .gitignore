@@ -31,6 +31,7 @@ build/
 # OS files
 .DS_Store
 Thumbs.db
+desktop.ini
 
 # Editor / IDE
 .vscode/
@@ -52,4 +53,5 @@ models/
 *.wav
 *.mp3
 *.tmp
+bakeoff/
 .venv-agent/

@@ -74,10 +74,17 @@ async def _close_stream(stream: Optional[object]) -> None:
     except Exception as e:
         logger.warning(f"Error closing stream: {e}")
 
-SYSTEM_PROMPT = """You are a helpful, conversational AI voice assistant.
-Keep your responses concise and natural for spoken conversation.
-Avoid using markdown, bullet points, or formatting — speak in plain sentences.
-Be warm, direct, and helpful. If you don't know something, say so clearly."""
+SYSTEM_PROMPT = """You are an automated voice assistant for Oak Lane Medical Practice, speaking with a caller in British English.
+Your role is to provide general practice information in short, clear, natural spoken sentences suitable for voice.
+Speak plainly and warmly. Do not use markdown, bullet points, asterisks, or lists. Ask only one question at a time. If anything is unclear, ask the caller to repeat it.
+
+Strict Grounding and Safety Rules:
+1. Automated Identity: State that you are an automated assistant only at the beginning of the conversation or when directly asked about your identity or staff transfer. Do not prepend "I am an automated assistant" to every response. You are not a doctor or human receptionist.
+2. Context Grounding: Answer strictly using facts from the provided practice context. If information is not in the context, explicitly state that you do not have that information and offer the practice telephone number (01632 960142) or suggest speaking with a member of staff. Never invent, assume, or speculate on practice opening hours, Saturday/weekend hours, or clinic schedules not explicitly provided in the context.
+3. No Clinical Advice: Never provide medical diagnosis, clinical triage, or medication advice.
+4. No Direct Actions: Never claim to book, cancel, or reschedule appointments, access medical records, or execute tasks yourself. Direct the caller on how they can do so (e.g. by calling 01632 960142 or using the NHS App).
+5. Human Transfer Requests: If the caller asks to speak with a person or staff member, explain that you are an automated assistant and that while practice staff can help, this demo cannot transfer telephone calls. Provide the practice number 01632 960142.
+6. Emergencies: If the caller describes a life-threatening medical emergency (such as severe chest pain, breathing difficulties, suspected stroke, heavy bleeding, or collapse), immediately advise them to hang up and dial 999."""
 
 
 class LLMError(RuntimeError):
@@ -95,6 +102,7 @@ async def stream_llm_response(
     session_id: str = "",
     use_rag: bool = True,
     client: Optional[AsyncGroq] = None,
+    rag_context: Optional[str] = None,
 ) -> AsyncGenerator[str, None]:
     """
     Stream LLM response tokens with automatic fallback and GPT-OSS reasoning support.
@@ -104,6 +112,7 @@ async def stream_llm_response(
         session_id: Identifier for session-scoped logging
         use_rag: Whether to inject RAG context
         client: Optional AsyncGroq client instance (for testing/dependency injection)
+        rag_context: Optional pre-retrieved RAG context string
 
     Yields:
         Text tokens as they are generated
@@ -118,17 +127,20 @@ async def stream_llm_response(
     # Build system prompt, optionally enhanced with RAG
     system_content = SYSTEM_PROMPT
 
-    if use_rag and conversation_history:
+    if rag_context:
+        system_content += f"\n\nPractice Knowledge Base Context:\n{rag_context}"
+        logger.info(f"[{session_id}] RAG context injected ({len(rag_context)} chars)")
+    elif use_rag and conversation_history:
         last_user_message = next(
             (m["content"] for m in reversed(conversation_history) if m["role"] == "user"),
             None
         )
         if last_user_message:
             try:
-                rag_context = await retrieve_context(last_user_message)
-                if rag_context:
-                    system_content += f"\n\nRelevant context from knowledge base:\n{rag_context}"
-                    logger.info(f"[{session_id}] RAG context injected ({len(rag_context)} chars)")
+                retrieved_context = await retrieve_context(last_user_message)
+                if retrieved_context:
+                    system_content += f"\n\nPractice Knowledge Base Context:\n{retrieved_context}"
+                    logger.info(f"[{session_id}] RAG context injected ({len(retrieved_context)} chars)")
             except Exception as e:
                 logger.warning(f"[{session_id}] RAG retrieval failed: {e}")
 
@@ -150,6 +162,7 @@ async def stream_llm_response(
         first_chunk_content = None
         stream = None
         stream_iter = None
+        terminal_finish_reason: Optional[str] = None
 
         create_kwargs = {
             "model": model,
@@ -178,7 +191,12 @@ async def stream_llm_response(
                         if not chunk.choices:
                             continue
 
-                        delta = chunk.choices[0].delta
+                        choice = chunk.choices[0]
+                        finish_reason = getattr(choice, "finish_reason", None)
+                        if finish_reason is not None:
+                            terminal_finish_reason = finish_reason
+
+                        delta = choice.delta
                         content = getattr(delta, "content", None)
                         if content:
                             first_chunk_content = content
@@ -207,7 +225,9 @@ async def stream_llm_response(
 
             # If stream closed without yielding any content (e.g. empty or reasoning only)
             if not first_token_received:
-                logger.warning(f"[{session_id}] Model {model} produced 0 content tokens")
+                logger.warning(
+                    f"[{session_id}] Model {model} produced 0 content tokens (finish_reason='{terminal_finish_reason}')"
+                )
                 # 0 tokens yielded -> continue to fallback (finally closes stream first)
                 continue
 
@@ -222,8 +242,8 @@ async def stream_llm_response(
                         async with asyncio.timeout(LLM_STREAM_IDLE_TIMEOUT_S):
                             chunk = await anext(stream_iter)
                     except StopAsyncIteration:
-                        # Stream completed normally
-                        return
+                        # Stream completed
+                        break
                     except TimeoutError:
                         logger.warning(
                             f"[{session_id}] Model {model} stream idle timeout after {LLM_STREAM_IDLE_TIMEOUT_S}s between chunks. Ending stream without fallback."
@@ -240,12 +260,32 @@ async def stream_llm_response(
                     if not chunk.choices:
                         continue
 
-                    delta = chunk.choices[0].delta
+                    choice = chunk.choices[0]
+                    finish_reason = getattr(choice, "finish_reason", None)
+                    if finish_reason is not None:
+                        terminal_finish_reason = finish_reason
+
+                    delta = choice.delta
                     content = getattr(delta, "content", None)
                     if content:
                         token_count += 1
                         yield content
 
+                if terminal_finish_reason == "length":
+                    logger.warning(
+                        f"[{session_id}] Model {model} stream truncated by token limit: "
+                        f"finish_reason='length' after {token_count} content tokens "
+                        f"(max_completion_tokens={LLM_MAX_COMPLETION_TOKENS})."
+                    )
+                elif terminal_finish_reason is not None:
+                    logger.info(
+                        f"[{session_id}] Model {model} stream completed: "
+                        f"finish_reason='{terminal_finish_reason}' ({token_count} content tokens)."
+                    )
+                else:
+                    logger.info(
+                        f"[{session_id}] Model {model} stream completed normally ({token_count} content tokens)."
+                    )
                 return
 
         finally:

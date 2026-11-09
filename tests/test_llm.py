@@ -15,10 +15,10 @@ from config import LLM_FALLBACK_MODEL, LLM_MODEL
 from llm import LLMError, _is_gpt_oss_model, stream_llm_response
 
 
-def make_chunk(content=None, reasoning=None):
+def make_chunk(content=None, reasoning=None, finish_reason=None):
     """Helper to build a mock streaming chunk."""
     delta = SimpleNamespace(content=content, reasoning=reasoning)
-    choice = SimpleNamespace(delta=delta)
+    choice = SimpleNamespace(delta=delta, finish_reason=finish_reason)
     return SimpleNamespace(choices=[choice])
 
 
@@ -230,7 +230,7 @@ class TestLLMStreaming:
         """A healthy long response is never cut by LLM_TIMEOUT_S as long as idle gaps stay low."""
         mock_client = MagicMock()
 
-        # 4 chunks, each taking 0.02s -> total duration ~0.08s
+        # 4 chunks, each taking 0.03s (~120ms total duration strictly exceeding 80ms TTFT timeout)
         chunks = [
             make_chunk(content="Part 1 "),
             make_chunk(content="Part 2 "),
@@ -238,13 +238,13 @@ class TestLLMStreaming:
             make_chunk(content="Part 4"),
         ]
         mock_client.chat.completions.create = AsyncMock(
-            return_value=MockAsyncStream(chunks, delay=0.02)
+            return_value=MockAsyncStream(chunks, delay=0.03)
         )
 
         history = [{"role": "user", "content": "Give a detailed response"}]
-        # Set initial TTFT timeout to 0.04s (first token arrives in 0.02s < 0.04s)
-        # Total duration is ~0.08s > 0.04s, but idle timeout is 0.5s > 0.02s
-        with patch("llm.LLM_TIMEOUT_S", 0.04), patch("llm.LLM_STREAM_IDLE_TIMEOUT_S", 0.5):
+        # Set initial TTFT timeout to 0.08s (first token arrives in ~0.03s < 0.08s)
+        # Total duration is ~0.12s > 0.08s, while idle timeout is 0.5s > 0.03s
+        with patch("llm.LLM_TIMEOUT_S", 0.08), patch("llm.LLM_STREAM_IDLE_TIMEOUT_S", 0.5):
             tokens = [
                 t
                 async for t in stream_llm_response(
@@ -455,3 +455,158 @@ class TestConfig:
         with patch("dotenv.load_dotenv") as mock_load_dotenv:
             importlib.reload(config)
             mock_load_dotenv.assert_called()
+
+
+class TestGroundingAndRAGPrompt:
+    @pytest.mark.asyncio
+    async def test_system_prompt_contains_grounding_rules_and_retrieved_context(self):
+        """The system message sent to the LLM contains grounding rules and retrieved RAG context."""
+        mock_client = MagicMock()
+        mock_stream = MockAsyncStream([make_chunk(content="Hello")])
+        mock_client.chat.completions.create = AsyncMock(return_value=mock_stream)
+
+        mock_rag_text = "[Source: practice_details.txt]\nOak Lane Medical Practice is located at 14 Oak Lane."
+
+        with patch("llm.retrieve_context", new=AsyncMock(return_value=mock_rag_text)):
+            history = [{"role": "user", "content": "Where is the surgery?"}]
+            tokens = [
+                t
+                async for t in stream_llm_response(
+                    history, session_id="test-grounding", use_rag=True, client=mock_client
+                )
+            ]
+
+        assert tokens == ["Hello"]
+        call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+        messages = call_kwargs["messages"]
+        system_msg = messages[0]
+        assert system_msg["role"] == "system"
+        content = system_msg["content"]
+
+        # Check for receptionist persona and grounding rules
+        assert "Oak Lane Medical Practice" in content
+        assert "automated voice assistant" in content
+        assert "British English" in content
+        assert "Context Grounding" in content
+        assert "01632 960142" in content
+        assert "999" in content
+        assert "No Clinical Advice" in content
+        assert "Human Transfer Requests" in content
+
+        # Check that retrieved RAG context is injected
+        assert "Practice Knowledge Base Context:" in content
+        assert "Oak Lane Medical Practice is located at 14 Oak Lane." in content
+
+
+class TestLLMFinishReason:
+    @pytest.mark.asyncio
+    async def test_normal_stream_completion_logs_stop(self, caplog):
+        """When stream finishes normally with finish_reason='stop', all tokens are yielded and info is logged."""
+        mock_client = MagicMock()
+        chunks = [
+            make_chunk(content="You can order a repeat prescription online."),
+            make_chunk(content=None, finish_reason="stop"),
+        ]
+        mock_client.chat.completions.create = AsyncMock(return_value=MockAsyncStream(chunks))
+
+        history = [{"role": "user", "content": "How do I order?"}]
+        with caplog.at_level("INFO", logger="llm"):
+            tokens = [
+                t
+                async for t in stream_llm_response(
+                    history, session_id="test-stop", use_rag=False, client=mock_client
+                )
+            ]
+
+        assert tokens == ["You can order a repeat prescription online."]
+        assert any(
+            "finish_reason='stop'" in record.message
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_finish_reason_length_logs_truncation_warning(self, caplog):
+        """When generation is truncated by token limit (finish_reason='length'), a warning is logged and tokens are preserved."""
+        mock_client = MagicMock()
+        chunks = [
+            make_chunk(content="Please allow two working days for "),
+            make_chunk(content="processing,", finish_reason="length"),
+        ]
+        mock_client.chat.completions.create = AsyncMock(return_value=MockAsyncStream(chunks))
+
+        history = [{"role": "user", "content": "How long does it take?"}]
+        with caplog.at_level("WARNING", logger="llm"):
+            tokens = [
+                t
+                async for t in stream_llm_response(
+                    history, session_id="test-length", use_rag=False, client=mock_client
+                )
+            ]
+
+        # Ensure no accidental loss of already-generated text
+        assert tokens == ["Please allow two working days for ", "processing,"]
+        # Ensure warning is logged explicitly
+        assert any(
+            "finish_reason='length'" in record.message
+            and "truncated by token limit" in record.message
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_finish_reason_length_on_terminal_empty_chunk(self, caplog):
+        """When finish_reason='length' arrives on a trailing chunk without content, all tokens are kept and warning is logged."""
+        mock_client = MagicMock()
+        chunks = [
+            make_chunk(content="Dispatched to your chosen pharmacy,"),
+            make_chunk(content=None, finish_reason="length"),
+        ]
+        mock_client.chat.completions.create = AsyncMock(return_value=MockAsyncStream(chunks))
+
+        history = [{"role": "user", "content": "Where does it go?"}]
+        with caplog.at_level("WARNING", logger="llm"):
+            tokens = [
+                t
+                async for t in stream_llm_response(
+                    history, session_id="test-length-empty", use_rag=False, client=mock_client
+                )
+            ]
+
+        assert tokens == ["Dispatched to your chosen pharmacy,"]
+        assert any(
+            "truncated by token limit" in record.message
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_fallback_still_works_when_primary_has_zero_content_tokens(self, caplog):
+        """If primary model yields 0 content tokens with finish_reason, fallback model is still invoked."""
+        mock_client = MagicMock()
+        # Primary stream: produces only reasoning and finish_reason='stop', 0 content tokens
+        primary_chunks = [
+            make_chunk(content=None, reasoning="Thinking..."),
+            make_chunk(content="", finish_reason="stop"),
+        ]
+        # Fallback stream: produces valid content
+        fallback_chunks = [
+            make_chunk(content="Oak Lane Medical Practice."),
+            make_chunk(content=None, finish_reason="stop"),
+        ]
+
+        mock_client.chat.completions.create = AsyncMock(
+            side_effect=[MockAsyncStream(primary_chunks), MockAsyncStream(fallback_chunks)]
+        )
+
+        history = [{"role": "user", "content": "Hello"}]
+        with caplog.at_level("WARNING", logger="llm"):
+            tokens = [
+                t
+                async for t in stream_llm_response(
+                    history, session_id="test-fallback-0token", use_rag=False, client=mock_client
+                )
+            ]
+
+        assert tokens == ["Oak Lane Medical Practice."]
+        assert mock_client.chat.completions.create.call_count == 2
+        assert any("produced 0 content tokens" in record.message for record in caplog.records)
+
+
